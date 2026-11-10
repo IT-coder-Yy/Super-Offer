@@ -1,0 +1,14 @@
+# 依赖缓存与构建产物。
+node_modules/
+target/
+dist/
+__pycache__/
+*.pyc
+**/src-tauri/gen/
+
+# 本地运行文件与凭证。
+.s0-work/
+.env
+.env.*
+!.env.example
+*.key
