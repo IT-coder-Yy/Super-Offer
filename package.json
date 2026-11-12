@@ -1,0 +1,31 @@
+{
+  "name": "super-offer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "licenses": "node scripts/collect-licenses.mjs",
+    "assets": "node scripts/prepare-assets.mjs && npm run licenses && tauri icon assets/icon.svg --output .s0-work/icons",
+    "dev": "npm run assets && vite --host 127.0.0.1",
+    "build": "npm run assets && tsc --noEmit && vite build",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "desktop": "tauri dev",
+    "desktop:build": "tauri build --no-bundle"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4",
+    "mammoth": "1.13.0",
+    "pdfjs-dist": "6.5.438",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "playwright-core": "1.65.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.8"
+  }
+}

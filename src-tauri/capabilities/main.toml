@@ -1,0 +1,4 @@
+identifier = "main"
+description = "本地工作台窗口；不授予远程页面、文件系统或 SQL 插件权限"
+windows = ["main"]
+permissions = ["core:default"]
