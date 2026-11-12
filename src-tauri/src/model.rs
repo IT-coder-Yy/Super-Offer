@@ -102,6 +102,13 @@ impl Runtime {
             version: id(),
         };
         config.validate()?;
+        let prior_slot = prior.as_ref().map(|p| Self::slot(&store, p));
+        let prior_secret = prior_slot
+            .as_ref()
+            .map(|slot| self.vault.get(slot))
+            .transpose()?
+            .flatten()
+            .map(Zeroizing::new);
         let secret = if request.remove_key {
             None
         } else if let Some(key) = request.key.filter(|k| !k.is_empty()) {
@@ -109,33 +116,45 @@ impl Runtime {
                 return Err(AppError::invalid("Key 格式不正确。"));
             }
             Some(Zeroizing::new(key))
-        } else if let Some(prior) = &prior {
-            self.vault
-                .get(&Self::slot(&store, prior))?
-                .map(Zeroizing::new)
         } else {
-            None
+            prior_secret.clone()
         };
         let slot = Self::slot(&store, &config);
-        if let Some(secret) = &secret {
-            self.vault.set(&slot, secret)?;
-        }
+        let mut old_deleted = false;
+        let mut new_written = false;
         let result = (|| {
             let tx = store.conn.transaction()?;
             put(&tx, "providers", config.purpose.key(), &config)?;
             bump(&tx)?;
+            // 先确认旧凭证可删除，再写新凭证；失败时原配置仍可用于重试。
+            if let Some(prior_slot) = &prior_slot {
+                self.vault.delete(prior_slot)?;
+                old_deleted = true;
+            }
+            if let Some(secret) = &secret {
+                self.vault.set(&slot, secret)?;
+                new_written = true;
+            }
             tx.commit()?;
             Ok::<_, AppError>(())
         })();
         if let Err(error) = result {
-            if secret.is_some() {
-                let _ = self.vault.delete(&slot);
+            let mut recovery_failed = false;
+            if new_written {
+                recovery_failed |= self.vault.delete(&slot).is_err();
+            }
+            if old_deleted {
+                if let (Some(slot), Some(secret)) = (&prior_slot, &prior_secret) {
+                    recovery_failed |= self.vault.set(slot, secret).is_err();
+                }
+            }
+            if recovery_failed {
+                return Err(AppError::new(
+                    "KEY_RECOVERY_FAILED",
+                    "配置未保存，且凭证回滚未完成。请检查系统凭证服务，重新配置 Key 并核对残留凭证。",
+                ));
             }
             return Err(error);
-        }
-        // 运行中的请求已经持有所需秘密，旧配置不需要留存凭证。
-        if let Some(prior) = prior {
-            let _ = self.vault.delete(&Self::slot(&store, &prior));
         }
         Ok(config)
     }

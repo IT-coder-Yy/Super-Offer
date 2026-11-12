@@ -491,6 +491,8 @@ fn excluded_and_missing_files_are_explicit_and_allow_further_profile_edits() {
 struct MemoryVault {
     values: Mutex<HashMap<String, String>>,
     denied: AtomicBool,
+    reject_delete: AtomicBool,
+    set_failures: Mutex<usize>,
 }
 impl Vault for MemoryVault {
     fn get(&self, slot: &str) -> Result<Option<String>> {
@@ -500,6 +502,11 @@ impl Vault for MemoryVault {
         Ok(self.values.lock().unwrap().get(slot).cloned())
     }
     fn set(&self, slot: &str, value: &str) -> Result<()> {
+        let mut failures = self.set_failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(AppError::new("KEY_UNAVAILABLE", "合成凭证写入失败"));
+        }
         if self.denied.load(Ordering::SeqCst) {
             return Err(AppError::new("KEY_UNAVAILABLE", "合成凭证拒绝"));
         }
@@ -510,8 +517,163 @@ impl Vault for MemoryVault {
         Ok(())
     }
     fn delete(&self, slot: &str) -> Result<()> {
+        if self.reject_delete.load(Ordering::SeqCst) {
+            return Err(AppError::new("KEY_UNAVAILABLE", "合成凭证删除失败"));
+        }
         self.values.lock().unwrap().remove(slot);
         Ok(())
+    }
+}
+fn provider_update(config: &ProviderConfig, key: Option<&str>, remove_key: bool) -> SaveProvider {
+    SaveProvider {
+        purpose: config.purpose,
+        name: config.name.clone(),
+        endpoint: config.endpoint.clone(),
+        model: config.model.clone(),
+        expected_version: Some(config.version.clone()),
+        key: key.map(str::to_owned),
+        remove_key,
+    }
+}
+
+#[test]
+fn rejected_key_deletion_preserves_config_and_retry_for_removal_and_replacement() {
+    for remove in [true, false] {
+        let (_dir, s) = fixture();
+        let vault = Arc::new(MemoryVault::default());
+        let runtime = Runtime::new(s, vault.clone(), Arc::new(|_| {}));
+        let config = provider(&runtime, Purpose::Chat, "https://example.test/chat");
+        let dataset = runtime.lock().unwrap().dataset_id.clone();
+        let slot = Runtime::slot(&runtime.lock().unwrap(), &config);
+        let before = runtime.lock().unwrap().snapshot().unwrap();
+        vault.reject_delete.store(true, Ordering::SeqCst);
+        let error = runtime
+            .save_provider(
+                &dataset,
+                provider_update(&config, Some("replacement-fixture"), remove),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "KEY_UNAVAILABLE");
+        let after = runtime.lock().unwrap().snapshot().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.providers[0].version, config.version);
+        assert_eq!(vault.values.lock().unwrap().len(), 1);
+        assert_eq!(
+            vault.get(&slot).unwrap().as_deref(),
+            Some("synthetic-key-not-real")
+        );
+        assert!(runtime.provider_status().unwrap()[0].has_key);
+        vault.reject_delete.store(false, Ordering::SeqCst);
+        let saved = runtime
+            .save_provider(
+                &dataset,
+                provider_update(&config, Some("replacement-fixture"), remove),
+            )
+            .unwrap();
+        assert_ne!(saved.version, config.version);
+        assert!(vault.get(&slot).unwrap().is_none());
+        assert_eq!(runtime.provider_status().unwrap()[0].has_key, !remove);
+        assert_eq!(vault.values.lock().unwrap().len(), usize::from(!remove));
+    }
+}
+
+#[test]
+fn key_write_failure_restores_old_key_and_allows_retry() {
+    let (_dir, s) = fixture();
+    let vault = Arc::new(MemoryVault::default());
+    let runtime = Runtime::new(s, vault.clone(), Arc::new(|_| {}));
+    let config = provider(&runtime, Purpose::Chat, "https://example.test/chat");
+    let dataset = runtime.lock().unwrap().dataset_id.clone();
+    let slot = Runtime::slot(&runtime.lock().unwrap(), &config);
+    *vault.set_failures.lock().unwrap() = 1;
+    assert_eq!(
+        runtime
+            .save_provider(
+                &dataset,
+                provider_update(&config, Some("replacement-fixture"), false)
+            )
+            .unwrap_err()
+            .code,
+        "KEY_UNAVAILABLE"
+    );
+    assert_eq!(
+        runtime.lock().unwrap().snapshot().unwrap().providers[0].version,
+        config.version
+    );
+    assert_eq!(
+        vault.get(&slot).unwrap().as_deref(),
+        Some("synthetic-key-not-real")
+    );
+    assert_eq!(vault.values.lock().unwrap().len(), 1);
+    runtime
+        .save_provider(&dataset, provider_update(&config, None, false))
+        .unwrap();
+    assert!(runtime.provider_status().unwrap()[0].has_key);
+    assert_eq!(vault.values.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn failed_database_commit_compensates_keys_and_reports_failed_compensation() {
+    for (remove, fail_recovery) in [(false, false), (true, false), (true, true)] {
+        let (_dir, s) = fixture();
+        let vault = Arc::new(MemoryVault::default());
+        let runtime = Runtime::new(s, vault.clone(), Arc::new(|_| {}));
+        let config = provider(&runtime, Purpose::Chat, "https://example.test/chat");
+        let dataset = runtime.lock().unwrap().dataset_id.clone();
+        let slot = Runtime::slot(&runtime.lock().unwrap(), &config);
+        let before = runtime.lock().unwrap().snapshot().unwrap().revision;
+        // 延迟外键约束在 COMMIT 时失败，覆盖凭证操作成功之后的补偿路径。
+        runtime.lock().unwrap().conn.execute_batch(
+            "CREATE TEMP TABLE fault_parent(id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE fault_child(id INTEGER REFERENCES fault_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TEMP TRIGGER fail_commit AFTER UPDATE ON providers BEGIN INSERT INTO fault_child VALUES(1); END;"
+        ).unwrap();
+        if fail_recovery {
+            *vault.set_failures.lock().unwrap() = 1;
+        }
+        let error = runtime
+            .save_provider(
+                &dataset,
+                provider_update(&config, Some("replacement-fixture"), remove),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if fail_recovery {
+                "KEY_RECOVERY_FAILED"
+            } else {
+                "WRITE_FAILED"
+            }
+        );
+        let after = runtime.lock().unwrap().snapshot().unwrap();
+        assert_eq!(after.providers[0].version, config.version);
+        assert_eq!(after.revision, before);
+        assert_eq!(
+            vault.get(&slot).unwrap().as_deref(),
+            if fail_recovery {
+                None
+            } else {
+                Some("synthetic-key-not-real")
+            }
+        );
+        assert_eq!(
+            vault.values.lock().unwrap().len(),
+            usize::from(!fail_recovery)
+        );
+        runtime
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER fail_commit;")
+            .unwrap();
+        runtime
+            .save_provider(
+                &dataset,
+                provider_update(&config, Some("retry-fixture"), false),
+            )
+            .unwrap();
+        assert!(runtime.provider_status().unwrap()[0].has_key);
+        assert_eq!(vault.values.lock().unwrap().len(), 1);
     }
 }
 fn provider(runtime: &Runtime, purpose: Purpose, endpoint: &str) -> ProviderConfig {
