@@ -753,10 +753,15 @@ export function ApplicationsPanel({
       {roundOpen && selected && (
         <Dialog
           title={round.id ? "编辑面试轮次" : "添加面试轮次"}
+          busy={busy}
           onCancel={() => setRoundOpen(false)}
           actions={
             <>
-              <button className="secondary" onClick={() => setRoundOpen(false)}>
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => setRoundOpen(false)}
+              >
                 取消
               </button>
               <button
@@ -797,6 +802,7 @@ export function ApplicationsPanel({
         >
           <Field label="轮次名称">
             <input
+              disabled={busy}
               value={round.title}
               placeholder="例如：技术一面"
               onChange={(e) => setRound({ ...round, title: e.target.value })}
@@ -804,6 +810,7 @@ export function ApplicationsPanel({
           </Field>
           <Field label="面试时间">
             <input
+              disabled={busy}
               type="datetime-local"
               value={round.scheduledAt}
               onChange={(e) =>
@@ -813,12 +820,14 @@ export function ApplicationsPanel({
           </Field>
           <Field label="地点或会议链接">
             <input
+              disabled={busy}
               value={round.location}
               onChange={(e) => setRound({ ...round, location: e.target.value })}
             />
           </Field>
           <Field label="轮次备注">
             <textarea
+              disabled={busy}
               value={round.notes}
               onChange={(e) => setRound({ ...round, notes: e.target.value })}
             />
@@ -826,6 +835,7 @@ export function ApplicationsPanel({
           <label className="check">
             <input
               type="checkbox"
+              disabled={busy}
               checked={round.completed}
               onChange={(e) =>
                 setRound({ ...round, completed: e.target.checked })

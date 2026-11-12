@@ -709,6 +709,62 @@ try {
     );
     await page.screenshot({ path: join(root, "board-900.png") });
   });
+  await step("PR1：保存轮次期间锁定编辑和关闭，失败保留草稿并可重试", async () => {
+    await page.setViewportSize({ width: 1240, height: 820 });
+    await page.locator(".row-link").first().click();
+    await page.getByRole("button", { name: "添加轮次", exact: true }).click();
+    await page.getByLabel("轮次名称", { exact: true }).fill("回归轮次 A");
+    await page.getByLabel("面试时间", { exact: true }).fill("2026-12-01T10:00");
+    const before = (await snapshot()).interviews.length;
+    // 只延迟本次合成请求；成功分支仍调用真实 Rust 后端。
+    await page.evaluate(() => {
+      window.regressionFetch = window.fetch;
+      window.fetch = (input, options) => {
+        let request;
+        if (typeof options?.body === "string") {
+          try { request = JSON.parse(options.body).request; } catch {}
+        }
+        if (request?.mutation?.kind !== "save_interview")
+          return window.regressionFetch(input, options);
+        return new Promise((resolve, reject) => {
+          window.releaseInterview = (fail) => {
+            window.releaseInterview = null;
+            if (fail) resolve(new Response(JSON.stringify({
+              code: "WRITE_FAILED", message: "合成写入失败，请重试。",
+            }), { headers: { "Content-Type": "application/json", "Tauri-Response": "error" } }));
+            else window.regressionFetch(input, options).then(resolve, reject);
+          };
+        });
+      };
+    });
+    try {
+      const dialog = page.getByRole("dialog", { name: "添加面试轮次" });
+      for (const fail of [true, false]) {
+        await dialog.getByRole("button", { name: "保存轮次", exact: true }).click();
+        await poll(() => page.evaluate(() => !!window.releaseInterview), "未收到合成保存请求");
+        for (const label of ["轮次名称", "面试时间", "地点或会议链接", "轮次备注", "此轮面试已完成"])
+          assert.ok(await dialog.getByLabel(label, { exact: true }).isDisabled());
+        for (const name of ["保存轮次", "取消", "关闭对话框"])
+          assert.ok(await dialog.getByRole("button", { name, exact: true }).isDisabled());
+        await page.keyboard.press("Escape");
+        assert.ok(await dialog.isVisible());
+        await page.evaluate((fail) => window.releaseInterview(fail), fail);
+        if (fail) {
+          await poll(async () => await dialog.getByLabel("轮次名称").isEnabled(), "失败后没有解锁");
+          assert.equal(await dialog.getByLabel("轮次名称").inputValue(), "回归轮次 A");
+          assert.equal((await snapshot()).interviews.length, before);
+          await dialog.getByLabel("轮次名称").fill("回归轮次 B");
+        } else {
+          await poll(async () => await dialog.count() === 0, "成功后未关闭");
+          const rounds = (await snapshot()).interviews;
+          assert.equal(rounds.length, before + 1);
+          assert.ok(rounds.some((r) => r.title === "回归轮次 B"));
+        }
+      }
+    } finally {
+      await page.evaluate(() => { window.fetch = window.regressionFetch; });
+    }
+  });
   assert.equal(errors.length, 0, errors.join("\n"));
   await writeFile(
     join(root, "results.json"),

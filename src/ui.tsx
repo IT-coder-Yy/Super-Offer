@@ -33,12 +33,14 @@ export function Dialog({
   onCancel,
   actions,
   wide = false,
+  busy = false,
 }: {
   title: string;
   children: ReactNode;
   onCancel: () => void;
   actions: ReactNode;
   wide?: boolean;
+  busy?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -51,7 +53,7 @@ export function Dialog({
       className={wide ? "wide-dialog" : ""}
       onCancel={(event) => {
         event.preventDefault();
-        onCancel();
+        if (!busy) onCancel();
       }}
       aria-label={title}
     >
@@ -60,6 +62,7 @@ export function Dialog({
         <button
           type="button"
           className="icon-button"
+          disabled={busy}
           onClick={onCancel}
           aria-label="关闭对话框"
         >
