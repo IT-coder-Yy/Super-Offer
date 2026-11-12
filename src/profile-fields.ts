@@ -197,12 +197,13 @@ export function materializeSelection(
 export function parseSuggestions(
   text: string,
   existing: ProfileData = emptyProfile(),
+  onAmbiguous?: (entry: string) => void,
 ): Suggestion[] {
   const suggestions: Suggestion[] = [];
   let group = FIELD_GROUPS[0];
   let row = 0;
-  let newRow = false;
-  const pendingRows: Record<string, number> = {};
+  let entry: { field: FieldDefinition; value: string; evidence: string }[] = [];
+  const nextRows: Record<string, number> = {};
   const add = (
     g: FieldGroup,
     field: FieldDefinition,
@@ -222,6 +223,42 @@ export function parseSuggestions(
       previous,
       choice: previous ? "pending" : "save",
     });
+  };
+  const flush = () => {
+    if (!entry.length) return;
+    const fields = Object.fromEntries(
+      entry.map((item) => [item.field.key, item.value]),
+    );
+    const firstKey = group.fields[0].key;
+    const rows = existing[group.key] as Fields[];
+    let matches = rows
+      .map((value, index) => ({ value, index }))
+      .filter(
+        ({ value }) => fields[firstKey] && value[firstKey] === fields[firstKey],
+      );
+    if (matches.length > 1) {
+      const identity = [
+        "degree", "major", "title", "type", "role", "startDate", "url", "issuer", "date",
+      ];
+      matches = matches.filter(({ value }) =>
+        identity.every(
+          (key) => !fields[key] || !value[key] || fields[key] === value[key],
+        ),
+      );
+      if (matches.length !== 1) {
+        onAmbiguous?.(`${group.label}：${fields[firstKey]}`);
+        entry = [];
+        return;
+      }
+    }
+    if (!fields[firstKey]) {
+      onAmbiguous?.(`${group.label}：缺少${group.fields[0].label}`);
+    } else {
+      row = matches[0]?.index ?? (nextRows[group.key] ?? rows.length);
+      if (!matches.length) nextRows[group.key] = row + 1;
+      for (const item of entry) add(group, item.field, item.value, item.evidence);
+    }
+    entry = [];
   };
   const aliases: Record<string, string> = {
     教育背景: "education",
@@ -243,14 +280,13 @@ export function parseSuggestions(
   for (const original of text.split(/\r?\n/)) {
     const line = original.trim();
     if (!line) {
-      newRow = true;
+      flush();
       continue;
     }
     const heading = aliases[line.replace(/[：:]$/, "")];
     if (heading) {
+      flush();
       group = FIELD_GROUPS.find((g) => g.key === heading)!;
-      row = pendingRows[group.key] ?? 0;
-      newRow = false;
       continue;
     }
     const pieces = line.split(/[；;|｜]/).map((p) => p.trim());
@@ -267,24 +303,16 @@ export function parseSuggestions(
           (key === "技术" && f.key === "technology"),
       );
       if (!field) continue;
-      if (group.repeat && field === group.fields[0]) {
-        const existingRows = existing[group.key] as Fields[];
-        const same = existingRows.findIndex((r) => r[field.key] === value);
-        const used = suggestions.some(
-          (s) => s.path === `${group.key}.${row}.${field.key}`,
-        );
-        row =
-          same >= 0
-            ? same
-            : used || newRow
-              ? Math.max(existingRows.length, row + (used ? 1 : 0))
-              : existingRows.length;
-        pendingRows[group.key] = row;
-        newRow = false;
-      }
-      add(group, field, value, original);
+      if (group.repeat) {
+        if (
+          field === group.fields[0] &&
+          entry.some((item) => item.field === field)
+        ) flush();
+        entry.push({ field, value, evidence: original });
+      } else add(group, field, value, original);
     }
   }
+  flush();
   const basic = FIELD_GROUPS[0];
   for (const [key, regex] of [
     ["email", /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi],

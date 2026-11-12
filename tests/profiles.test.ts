@@ -78,6 +78,54 @@ test("日期冲突仅本次使用、待确认、保留与保存相互独立", ()
   assert.equal(original.education[0].major, undefined);
 });
 
+test("同校本科和硕士按完整经历匹配，修改结束时间不覆盖本科", () => {
+  const original = emptyProfile();
+  original.education = [
+    { school: "同一大学", degree: "本科", startDate: "2018-09", endDate: "2022-06" },
+    { school: "同一大学", degree: "硕士", startDate: "2022-09", endDate: "2025-06" },
+  ];
+  const suggestions = parseSuggestions(
+    "教育经历\n学校：同一大学；学历：本科；开始时间：2018-09；结束时间：2022-06\n学校：同一大学\n学历：硕士\n开始时间：2022-09\n结束时间：2026-06",
+    original,
+  );
+  assert.deepEqual(suggestions.map((s) => s.path), ["education.1.endDate"]);
+  const result = applySuggestions(original, suggestions.map((s) => ({ ...s, choice: "save" })));
+  assert.deepEqual(result.saved.education[0], original.education[0]);
+  assert.equal(result.saved.education[1].endDate, "2026-06");
+});
+
+test("同公司不同岗位、同名项目按经历身份匹配", () => {
+  const original = emptyProfile();
+  original.experience = [
+    { company: "样本公司", title: "前端", startDate: "2023-01", endDate: "2023-06" },
+    { company: "样本公司", title: "后端", startDate: "2024-01", endDate: "2024-06" },
+  ];
+  original.projects = [
+    { name: "项目", role: "开发", startDate: "2023-01", description: "第一期" },
+    { name: "项目", role: "负责人", startDate: "2024-01", description: "第二期" },
+  ];
+  const suggestions = parseSuggestions(
+    "工作经历\n公司：样本公司；岗位：后端；开始时间：2024-01；结束时间：2024-08\n项目经历\n项目名称：项目；项目角色：负责人；开始时间：2024-01；项目介绍：第二期更新",
+    original,
+  );
+  assert.deepEqual(suggestions.map((s) => s.path), ["experience.1.endDate", "projects.1.description"]);
+});
+
+test("经历归属不唯一时明确提示，不生成指向首条的建议", () => {
+  const original = emptyProfile();
+  original.education = [
+    { school: "同一大学", degree: "本科", startDate: "2018-09" },
+    { school: "同一大学", degree: "硕士", startDate: "2022-09" },
+  ];
+  for (const details of ["结束时间：2026-06", "学历：博士；开始时间：2025-09"]) {
+    const ambiguous: string[] = [];
+    const suggestions = parseSuggestions(`教育经历\n学校：同一大学；${details}\n基本信息\n姓名：合成求职者`, original, (entry) => ambiguous.push(entry));
+    assert.deepEqual(ambiguous, ["教育经历：同一大学"]);
+    assert.deepEqual(suggestions.map((s) => s.path), ["basic.name"]);
+    assert.deepEqual(applySuggestions(original, suggestions).saved.education, original.education);
+  }
+});
+
 test("缺项可以编辑，非法映射路径拒绝且不能修改原对象", () => {
   const empty = emptyProfile();
   assert.equal(missingGroups(empty).length, 8);

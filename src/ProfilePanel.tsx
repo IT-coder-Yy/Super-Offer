@@ -50,6 +50,7 @@ export function ProfilePanel({ workspace, reload, notify, onDirty }: Props) {
     asset: FileAsset;
     text: string;
     suggestions: Suggestion[];
+    ambiguous: string[];
   } | null>(null);
   const [once, setOnce] = useState<Fields>({});
   const [onceResume, setOnceResume] = useState<FileAsset | null>(null);
@@ -141,10 +142,14 @@ export function ProfilePanel({ workspace, reload, notify, onDirty }: Props) {
         assetKind: "resume",
       });
       await reload();
+      const ambiguous: string[] = [];
       setReview({
         asset: imported,
         text,
-        suggestions: parseSuggestions(text, data),
+        suggestions: parseSuggestions(text, data, (entry) =>
+          ambiguous.push(entry),
+        ),
+        ambiguous,
       });
     } catch (error) {
       notify(
@@ -543,6 +548,12 @@ export function ProfilePanel({ workspace, reload, notify, onDirty }: Props) {
             </div>
             <div>
               <h3>字段建议</h3>
+              {!!review.ambiguous.length && (
+                <p className="notice" role="status">
+                  以下经历无法唯一匹配，未自动预填。请使用下方“手动映射原文到字段”核对归属：
+                  {review.ambiguous.join("；")}
+                </p>
+              )}
               {review.suggestions.length ? (
                 review.suggestions.map((suggestion, index) => (
                   <div

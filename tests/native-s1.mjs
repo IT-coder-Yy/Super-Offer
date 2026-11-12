@@ -765,6 +765,41 @@ try {
       await page.evaluate(() => { window.fetch = window.regressionFetch; });
     }
   });
+  await step("PR1：同校经历正确归属，歧义提示支持现有手动映射", async () => {
+    await tab("个人档案");
+    await page.getByLabel("学历", { exact: true }).first().fill("本科");
+    await page.getByRole("button", { name: "＋ 添加教育经历", exact: true }).click();
+    await page.getByLabel("学校", { exact: true }).nth(1).fill("样本大学");
+    await page.getByLabel("学历", { exact: true }).nth(1).fill("硕士");
+    await page.getByLabel("开始时间", { exact: true }).nth(1).fill("2026-09");
+    await page.getByLabel("结束时间", { exact: true }).nth(1).fill("2029-06");
+    await saveProfile();
+    const updated = join(root, "same-school.docx");
+    await writeFile(updated, docx(["教育经历", "学校：样本大学；学历：硕士；开始时间：2026-09；结束时间：2030-06"]));
+    await importFile(updated);
+    const review = page.getByRole("dialog", { name: "核对简历提取内容" });
+    assert.equal(await review.locator(".suggestion").count(), 1);
+    assert.match(await review.locator(".suggestion strong").innerText(), /教育经历 2.*结束时间/);
+    await review.locator(".suggestion select").selectOption("save");
+    await review.getByRole("button", { name: "应用已确认字段" }).click();
+    assert.equal(await page.getByLabel("学历", { exact: true }).first().inputValue(), "本科");
+    assert.equal(await page.getByLabel("结束时间", { exact: true }).nth(1).inputValue(), "2030-06");
+    await saveProfile();
+    const ambiguous = join(root, "ambiguous-school.docx");
+    await writeFile(ambiguous, docx(["教育经历", "学校：样本大学；结束时间：2031-06"]));
+    await importFile(ambiguous);
+    assert.match(await review.getByRole("status").innerText(), /无法唯一匹配/);
+    assert.equal(await review.locator(".suggestion").count(), 0);
+    await review.getByText("手动映射原文到字段", { exact: true }).click();
+    await review.getByLabel("目标字段").selectOption("education.1.endDate");
+    await review.getByLabel("已核对的文字").fill("2031-06");
+    await review.getByRole("button", { name: "加入待确认字段" }).click();
+    await review.locator(".suggestion select").selectOption("save");
+    await review.getByRole("button", { name: "应用已确认字段" }).click();
+    await saveProfile();
+    assert.equal(await page.getByLabel("学历", { exact: true }).first().inputValue(), "本科");
+    assert.equal(await page.getByLabel("结束时间", { exact: true }).nth(1).inputValue(), "2031-06");
+  });
   assert.equal(errors.length, 0, errors.join("\n"));
   await writeFile(
     join(root, "results.json"),
