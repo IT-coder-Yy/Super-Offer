@@ -936,6 +936,10 @@ dialog footer {
   max-height: 480px;
   overflow: auto;
 }
+.license-text {
+  width: 100%;
+  height: min(480px, 55vh);
+}
 .suggestion {
   margin: 12px 0;
   padding: 12px;

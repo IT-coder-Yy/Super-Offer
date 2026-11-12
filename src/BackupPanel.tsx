@@ -73,7 +73,14 @@ export function BackupPanel({
             </button>
           }
         >
-          <pre className="source-text">{licenses}</pre>
+          <textarea
+            className="source-text license-text"
+            aria-label="第三方许可全文内容"
+            value={licenses}
+            readOnly
+            wrap="off"
+            spellCheck={false}
+          />
         </Dialog>
       )}
       <section className="settings-section">

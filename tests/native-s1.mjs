@@ -690,9 +690,10 @@ try {
       .click();
     await page.getByRole("dialog", { name: "第三方许可全文" }).waitFor();
     assert.match(
-      await page.getByRole("dialog").innerText(),
+      await page.getByLabel("第三方许可全文内容").inputValue(),
       /Mozilla Public License/,
     );
+    await page.screenshot({ path: join(root, "licenses.png") });
     await page
       .getByRole("dialog")
       .getByRole("button", { name: "关闭", exact: true })
