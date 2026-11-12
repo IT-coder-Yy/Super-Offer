@@ -126,6 +126,21 @@ test("经历归属不唯一时明确提示，不生成指向首条的建议", ()
   }
 });
 
+test("连续导入时新选择替换同字段临时值，保留其他字段和待确认选择", () => {
+  const data = writeField(emptyProfile(), "basic.phone", "13800000000");
+  const overrides = { "basic.phone": "13900000000", "basic.email": "once@example.test" };
+  const suggestion = parseSuggestions("手机：13700000000", data)[0];
+  for (const choice of ["save", "keep", "once", "pending"] as const) {
+    const result = applySuggestions(data, [{ ...suggestion, choice }], overrides);
+    const preview = materializeSelection(result.saved, result.once);
+    assert.equal(preview.basic.phone, { save: "13700000000", keep: "13800000000", once: "13700000000", pending: "13900000000" }[choice]);
+    assert.equal(preview.basic.email, "once@example.test");
+    assert.equal(result.pending.length, choice === "pending" ? 1 : 0);
+    assert.equal(result.saved.basic.phone, choice === "save" ? "13700000000" : "13800000000");
+  }
+  assert.equal(overrides["basic.phone"], "13900000000");
+});
+
 test("缺项可以编辑，非法映射路径拒绝且不能修改原对象", () => {
   const empty = emptyProfile();
   assert.equal(missingGroups(empty).length, 8);

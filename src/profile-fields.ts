@@ -171,10 +171,16 @@ export function writeField(
   } else if (!Array.isArray(target)) target[index] = value;
   return result;
 }
-export function applySuggestions(data: ProfileData, suggestions: Suggestion[]) {
+export function applySuggestions(
+  data: ProfileData,
+  suggestions: Suggestion[],
+  overrides: Fields = {},
+) {
   let saved = structuredClone(data);
-  const once: Fields = {};
+  const once = { ...overrides };
   for (const suggestion of suggestions) {
+    if (suggestion.choice === "save" || suggestion.choice === "keep")
+      delete once[suggestion.path];
     if (suggestion.choice === "save")
       saved = writeField(saved, suggestion.path, suggestion.value);
     if (suggestion.choice === "once") once[suggestion.path] = suggestion.value;

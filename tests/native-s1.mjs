@@ -800,6 +800,49 @@ try {
     assert.equal(await page.getByLabel("学历", { exact: true }).first().inputValue(), "本科");
     assert.equal(await page.getByLabel("结束时间", { exact: true }).nth(1).inputValue(), "2031-06");
   });
+  await step("PR1：连续导入替换临时值，待确认及其他字段保留，清空后更新简历来源", async () => {
+    const review = page.getByRole("dialog", { name: "核对简历提取内容" });
+    async function choose(name, lines, choice) {
+      const file = join(root, name);
+      await writeFile(file, docx(lines));
+      await importFile(file);
+      const selects = review.locator(".suggestion select");
+      assert.ok(await selects.count() > 0);
+      for (const select of await selects.all()) await select.selectOption(choice);
+      await review.getByRole("button", { name: "应用已确认字段" }).click();
+    }
+    async function preview(phone) {
+      await page.getByRole("button", { name: "查看本次资料" }).click();
+      const dialog = page.getByRole("dialog", { name: "本次资料预览" });
+      assert.equal(await dialog.getByLabel("手机", { exact: true }).inputValue(), phone);
+      assert.equal(await dialog.getByLabel("邮箱", { exact: true }).inputValue(), "once@example.test");
+      await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+    }
+    await choose("once.docx", ["手机：13900000000", "邮箱：once@example.test"], "once");
+    await preview("13900000000");
+    await choose("save.docx", ["手机：13700000000"], "save");
+    await saveProfile();
+    assert.equal(await page.getByLabel("手机", { exact: true }).inputValue(), "13700000000");
+    await preview("13700000000");
+    assert.match(await page.locator(".profile-editor .notice").first().innerText(), /本次简历：once.docx/);
+    await choose("new-once.docx", ["手机：13600000000"], "once");
+    await preview("13600000000");
+    await choose("pending.docx", ["手机：13500000000"], "pending");
+    assert.ok(await review.isVisible());
+    assert.equal(await review.locator(".suggestion select").inputValue(), "pending");
+    await review.getByRole("button", { name: "取消预填" }).click();
+    await preview("13600000000");
+    await choose("keep.docx", ["手机：13500000000"], "keep");
+    await preview("13700000000");
+    await choose("clear-last.docx", ["邮箱：different@example.test"], "keep");
+    assert.equal(await page.getByRole("button", { name: "查看本次资料" }).count(), 0);
+    await saveProfile();
+    const state = await snapshot();
+    const profile = state.profiles[0];
+    const data = profile.versions.find((v) => v.id === profile.currentVersionId).data;
+    assert.equal(data.basic.phone, "13700000000");
+    assert.equal(state.assets.find((a) => a.id === data.resumeAssetId).name, "clear-last.docx");
+  });
   assert.equal(errors.length, 0, errors.join("\n"));
   await writeFile(
     join(root, "results.json"),

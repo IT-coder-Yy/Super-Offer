@@ -163,18 +163,22 @@ export function ProfilePanel({ workspace, reload, notify, onDirty }: Props) {
   }
   function applyReview() {
     if (!review) return;
-    const result = applySuggestions(data, review.suggestions);
+    const result = applySuggestions(data, review.suggestions, once);
     setData({
       ...result.saved,
       resumeAssetId:
-        result.pending.length ||
-        Object.keys(result.once).length ||
-        Object.keys(once).length
+        result.pending.length || Object.keys(result.once).length
           ? data.resumeAssetId
           : review.asset.id,
     });
-    setOnce((previous) => ({ ...previous, ...result.once }));
-    if (Object.keys(result.once).length) setOnceResume(review.asset);
+    setOnce(result.once);
+    setOnceResume(
+      Object.keys(result.once).length
+        ? review.suggestions.some((s) => s.choice === "once")
+          ? review.asset
+          : onceResume
+        : null,
+    );
     if (result.pending.length) {
       setReview({ ...review, suggestions: result.pending });
       notify("已应用无冲突字段，其余冲突仍待确认。");
