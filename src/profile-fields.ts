@@ -210,6 +210,7 @@ export function parseSuggestions(
   let row = 0;
   let entry: { field: FieldDefinition; value: string; evidence: string }[] = [];
   const nextRows: Record<string, number> = {};
+  const matchedRows = new Set<string>();
   const add = (
     g: FieldGroup,
     field: FieldDefinition,
@@ -240,18 +241,23 @@ export function parseSuggestions(
     let matches = rows
       .map((value, index) => ({ value, index }))
       .filter(
-        ({ value }) => fields[firstKey] && value[firstKey] === fields[firstKey],
+        ({ value, index }) =>
+          fields[firstKey] && value[firstKey] === fields[firstKey] &&
+          !matchedRows.has(`${group.key}.${index}`),
       );
-    if (matches.length > 1) {
+    if (matches.length) {
+      const multiple = matches.length > 1;
       const identity = [
-        "degree", "major", "title", "type", "role", "startDate", "url", "issuer", "date",
+        "degree", "major", "title", "type", "role", "url", "issuer",
       ];
+      // 唯一经历的日期仍可作为待确认修订；多候选才用日期辅助定位。
+      if (multiple) identity.push("startDate", "date");
       matches = matches.filter(({ value }) =>
         identity.every(
           (key) => !fields[key] || !value[key] || fields[key] === value[key],
         ),
       );
-      if (matches.length !== 1) {
+      if (multiple && matches.length !== 1) {
         onAmbiguous?.(`${group.label}：${fields[firstKey]}`);
         entry = [];
         return;
@@ -262,6 +268,7 @@ export function parseSuggestions(
     } else {
       row = matches[0]?.index ?? (nextRows[group.key] ?? rows.length);
       if (!matches.length) nextRows[group.key] = row + 1;
+      matchedRows.add(`${group.key}.${row}`);
       for (const item of entry) add(group, item.field, item.value, item.evidence);
     }
     entry = [];

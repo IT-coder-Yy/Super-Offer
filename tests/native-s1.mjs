@@ -765,19 +765,32 @@ try {
       await page.evaluate(() => { window.fetch = window.regressionFetch; });
     }
   });
-  await step("PR1：同校经历正确归属，歧义提示支持现有手动映射", async () => {
+  await step("PR1：分段 DOCX 新增同校经历、更新与歧义手动映射", async () => {
     await tab("个人档案");
     await page.getByLabel("学历", { exact: true }).first().fill("本科");
-    await page.getByRole("button", { name: "＋ 添加教育经历", exact: true }).click();
-    await page.getByLabel("学校", { exact: true }).nth(1).fill("样本大学");
-    await page.getByLabel("学历", { exact: true }).nth(1).fill("硕士");
-    await page.getByLabel("开始时间", { exact: true }).nth(1).fill("2026-09");
-    await page.getByLabel("结束时间", { exact: true }).nth(1).fill("2029-06");
+    await saveProfile();
+    const added = join(root, "same-school-paragraphs.docx");
+    await writeFile(added, docx([
+      "教育经历", "学校：样本大学", "学历：本科", "开始时间：2022-09", "结束时间：2026-06",
+      "学校：样本大学", "学历：硕士", "开始时间：2026-09", "结束时间：2029-06",
+    ]));
+    await importFile(added);
+    const review = page.getByRole("dialog", { name: "核对简历提取内容" });
+    assert.equal(await review.locator(".suggestion").count(), 4);
+    for (const label of await review.locator(".suggestion strong").allTextContents())
+      assert.match(label, /教育经历 2/);
+    assert.equal(await review.getByRole("status").count(), 0);
+    await review.getByRole("button", { name: "应用已确认字段" }).click();
+    assert.equal(await page.getByLabel("学校", { exact: true }).count(), 2);
+    assert.equal(await page.getByLabel("学历", { exact: true }).first().inputValue(), "本科");
+    assert.equal(await page.getByLabel("结束时间", { exact: true }).first().inputValue(), "2026-06");
+    assert.equal(await page.getByLabel("学历", { exact: true }).nth(1).inputValue(), "硕士");
+    assert.equal(await page.getByLabel("开始时间", { exact: true }).nth(1).inputValue(), "2026-09");
+    assert.equal(await page.getByLabel("结束时间", { exact: true }).nth(1).inputValue(), "2029-06");
     await saveProfile();
     const updated = join(root, "same-school.docx");
     await writeFile(updated, docx(["教育经历", "学校：样本大学", "学历：硕士", "开始时间：2026-09", "结束时间：2030-06"]));
     await importFile(updated);
-    const review = page.getByRole("dialog", { name: "核对简历提取内容" });
     assert.equal(await review.locator(".suggestion").count(), 1);
     assert.match(await review.locator(".suggestion strong").innerText(), /教育经历 2.*结束时间/);
     await review.locator(".suggestion select").selectOption("save");

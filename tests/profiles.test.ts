@@ -96,6 +96,43 @@ test("同校本科和硕士按完整经历匹配，修改结束时间不覆盖�
   assert.equal(result.saved.education[1].endDate, "2026-06");
 });
 
+test("单个同名候选也核对身份，新增硕士不会覆盖原本科", () => {
+  const original = emptyProfile();
+  original.education = [
+    { school: "同一大学", degree: "本科", startDate: "2018-09", endDate: "2022-06" },
+  ];
+  const bachelor = "学校：同一大学；学历：本科；开始时间：2018-09；结束时间：2022-06";
+  const master = "学校：同一大学；学历：硕士；开始时间：2022-09；结束时间：2026-06";
+  for (const entries of [[bachelor, master], [master, bachelor], [master]]) {
+    const ambiguous: string[] = [];
+    const suggestions = parseSuggestions(
+      ["教育经历", ...entries].join("\n"), original,
+      (entry) => ambiguous.push(entry),
+    );
+    const after = applySuggestions(original, suggestions.map((s) => ({ ...s, choice: "save" }))).saved;
+    assert.deepEqual(after.education[0], original.education[0]);
+    assert.equal(after.education.length, 2);
+    assert.equal(after.education[1].degree, "硕士");
+    assert.equal(after.education[1].endDate, "2026-06");
+    assert.deepEqual(ambiguous, []);
+  }
+});
+
+test("本次导入已匹配的条目不再复用，即使首次匹配没有字段变更", () => {
+  const original = emptyProfile();
+  original.experience = [
+    { company: "样本公司", title: "研发实习", startDate: "2023-01", endDate: "2023-06" },
+  ];
+  const suggestions = parseSuggestions(
+    "工作经历\n公司：样本公司；岗位：研发实习；开始时间：2023-01；结束时间：2023-06\n公司：样本公司；岗位：研发实习；开始时间：2024-01；结束时间：2024-06",
+    original,
+  );
+  const after = applySuggestions(original, suggestions.map((s) => ({ ...s, choice: "save" }))).saved;
+  assert.deepEqual(after.experience[0], original.experience[0]);
+  assert.equal(after.experience.length, 2);
+  assert.equal(after.experience[1].startDate, "2024-01");
+});
+
 test("真实 DOCX 分段提取的空行不拆散经历，学校与章节仍划分条目", async () => {
   const { value: text } = await mammoth.extractRawText({ buffer: docx([
     "教育经历", "学校：样本大学", "学历：硕士", "开始时间：2026-09", "结束时间：2029-06",
