@@ -775,7 +775,7 @@ try {
     await page.getByLabel("结束时间", { exact: true }).nth(1).fill("2029-06");
     await saveProfile();
     const updated = join(root, "same-school.docx");
-    await writeFile(updated, docx(["教育经历", "学校：样本大学；学历：硕士；开始时间：2026-09；结束时间：2030-06"]));
+    await writeFile(updated, docx(["教育经历", "学校：样本大学", "学历：硕士", "开始时间：2026-09", "结束时间：2030-06"]));
     await importFile(updated);
     const review = page.getByRole("dialog", { name: "核对简历提取内容" });
     assert.equal(await review.locator(".suggestion").count(), 1);

@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import mammoth from "mammoth";
+import { docx } from "./fixtures.mjs";
 import { emptyProfile, type Application, type Snapshot } from "../src/types.ts";
 import {
   FIELD_GROUPS,
@@ -92,6 +94,24 @@ test("同校本科和硕士按完整经历匹配，修改结束时间不覆盖�
   const result = applySuggestions(original, suggestions.map((s) => ({ ...s, choice: "save" })));
   assert.deepEqual(result.saved.education[0], original.education[0]);
   assert.equal(result.saved.education[1].endDate, "2026-06");
+});
+
+test("真实 DOCX 分段提取的空行不拆散经历，学校与章节仍划分条目", async () => {
+  const { value: text } = await mammoth.extractRawText({ buffer: docx([
+    "教育经历", "学校：样本大学", "学历：硕士", "开始时间：2026-09", "结束时间：2029-06",
+    "学校：另一所大学", "学历：博士", "开始时间：2029-09", "结束时间：2033-06",
+    "工作经历", "公司：样本公司", "岗位：研发实习",
+  ]) });
+  assert.match(text, /学校：样本大学\n\n学历：硕士/);
+  const ambiguous: string[] = [];
+  const suggestions = parseSuggestions(text, emptyProfile(), (entry) => ambiguous.push(entry));
+  const after = applySuggestions(emptyProfile(), suggestions).saved;
+  assert.deepEqual(after.education, [
+    { school: "样本大学", degree: "硕士", startDate: "2026-09", endDate: "2029-06" },
+    { school: "另一所大学", degree: "博士", startDate: "2029-09", endDate: "2033-06" },
+  ]);
+  assert.deepEqual(after.experience, [{ company: "样本公司", title: "研发实习" }]);
+  assert.deepEqual(ambiguous, []);
 });
 
 test("同公司不同岗位、同名项目按经历身份匹配", () => {

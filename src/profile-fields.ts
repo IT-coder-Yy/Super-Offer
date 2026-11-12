@@ -285,10 +285,7 @@ export function parseSuggestions(
   };
   for (const original of text.split(/\r?\n/)) {
     const line = original.trim();
-    if (!line) {
-      flush();
-      continue;
-    }
+    if (!line) continue;
     const heading = aliases[line.replace(/[：:]$/, "")];
     if (heading) {
       flush();
