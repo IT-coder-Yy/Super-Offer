@@ -856,6 +856,49 @@ try {
     assert.equal(data.basic.phone, "13700000000");
     assert.equal(state.assets.find((a) => a.id === data.resumeAssetId).name, "clear-last.docx");
   });
+  await step("PR1：学历前置重导入不重复，缺学校的后条不污染已保存经历", async () => {
+    await page.getByRole("button", { name: "新建档案", exact: true }).click();
+    await page.getByLabel("档案名称", { exact: true }).fill("经历边界回归");
+    const reordered = join(root, "degree-first.docx");
+    await writeFile(reordered, docx([
+      "教育经历",
+      "学历：本科；学校：甲大学；开始时间：2018-09；结束时间：2022-06",
+      "学历：硕士；学校：乙大学；开始时间：2022-09；结束时间：2026-06",
+    ]));
+    const expected = [
+      { school: "甲大学", degree: "本科", startDate: "2018-09", endDate: "2022-06" },
+      { school: "乙大学", degree: "硕士", startDate: "2022-09", endDate: "2026-06" },
+    ];
+    async function savedEducation() {
+      const profile = (await snapshot()).profiles.find((p) => p.name === "经历边界回归");
+      return profile.versions.find((v) => v.id === profile.currentVersionId).data.education;
+    }
+    const review = page.getByRole("dialog", { name: "核对简历提取内容" });
+    for (const count of [8, 0]) {
+      await importFile(reordered);
+      assert.equal(await review.locator(".suggestion").count(), count);
+      assert.equal(await review.getByRole("status").count(), 0);
+      await review.getByRole("button", { name: "应用已确认字段" }).click();
+      await saveProfile();
+      assert.deepEqual(await savedEducation(), expected);
+    }
+    for (const tail of [
+      ["专业：计算机；学历：硕士；开始时间：2022-09；结束时间：2026-06"],
+      ["学校：", "专业：计算机", "学历：硕士", "开始时间：2022-09", "结束时间：2026-06"],
+    ]) {
+      const partial = join(root, "missing-school.docx");
+      await writeFile(partial, docx([
+        "教育经历", "学校：甲大学；学历：本科；开始时间：2018-09；结束时间：2022-06", ...tail,
+      ]));
+      await importFile(partial);
+      assert.match(await review.getByRole("status").innerText(), /缺少学校/);
+      assert.equal(await review.locator(".suggestion").count(), 0);
+      assert.match(await review.locator(".source-text").innerText(), /计算机/);
+      await review.getByRole("button", { name: "应用已确认字段" }).click();
+      await saveProfile();
+      assert.deepEqual(await savedEducation(), expected);
+    }
+  });
   assert.equal(errors.length, 0, errors.join("\n"));
   await writeFile(
     join(root, "results.json"),
