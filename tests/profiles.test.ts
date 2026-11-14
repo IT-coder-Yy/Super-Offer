@@ -151,6 +151,103 @@ test("真实 DOCX 分段提取的空行不拆散经历，学校与章节仍划�
   assert.deepEqual(ambiguous, []);
 });
 
+test("缺少学校的后续经历提示缺项，不把新字段拼入前条", async () => {
+  const bachelor = {
+    school: "样本大学", degree: "本科", startDate: "2018-09", endDate: "2022-06",
+  };
+  for (const paragraph of [
+    "学历：硕士；开始时间：2022-09；结束时间：2026-06；专业：计算机",
+    "专业：计算机；学历：硕士；开始时间：2022-09；结束时间：2026-06",
+    "专业：计算机；学校：；学历：硕士；开始时间：2022-09；结束时间：2026-06",
+    "学校：\n专业：计算机\n学历：硕士\n开始时间：2022-09\n结束时间：2026-06",
+  ]) {
+    const { value: text } = await mammoth.extractRawText({ buffer: docx([
+      "教育经历", "学校：样本大学；学历：本科；开始时间：2018-09；结束时间：2022-06",
+      ...paragraph.split("\n"),
+    ]) });
+    for (const existing of [emptyProfile(), { ...emptyProfile(), education: [bachelor] }]) {
+      const ambiguous: string[] = [];
+      const suggestions = parseSuggestions(text, existing, (entry) => ambiguous.push(entry));
+      const after = applySuggestions(existing, suggestions.map((s) => ({ ...s, choice: "save" }))).saved;
+      assert.deepEqual(after.education, [bachelor]);
+      assert.deepEqual(ambiguous, ["教育经历：缺少学校"]);
+      assert.ok(!suggestions.some((s) => s.path.endsWith(".major")));
+    }
+  }
+});
+
+test("学历前置的真实 DOCX 正确新增，再次导入不新增第三条", async () => {
+  for (const prefix of ["", "专业：计算机；"]) {
+    const { value: text } = await mammoth.extractRawText({ buffer: docx([
+      "教育经历", "学历：本科；学校：甲大学", `${prefix}学历：硕士；学校：乙大学`,
+    ]) });
+    const expected = [
+      { degree: "本科", school: "甲大学" },
+      { degree: "硕士", school: "乙大学", ...(prefix ? { major: "计算机" } : {}) },
+    ];
+    for (const existing of [emptyProfile(), { ...emptyProfile(), education: expected }]) {
+      const ambiguous: string[] = [];
+      const suggestions = parseSuggestions(text, existing, (entry) => ambiguous.push(entry));
+      const after = applySuggestions(existing, suggestions).saved;
+      assert.deepEqual(after.education, expected);
+      assert.deepEqual(ambiguous, []);
+      if (existing.education.length) assert.deepEqual(suggestions, []);
+    }
+  }
+});
+
+test("经历字段顺序、单段及逐字段分段、新增及重导入组合保持归属", () => {
+  function orders(values: string[]): string[][] {
+    return values.length ? values.flatMap((value, index) =>
+      orders(values.filter((_, i) => i !== index)).map((tail) => [value, ...tail]),
+    ) : [[]];
+  }
+  let checked = 0;
+  for (const secondSchool of ["甲大学", "乙大学"]) {
+    const expected = [
+      { school: "甲大学", degree: "本科", startDate: "2018-09", endDate: "2022-06" },
+      { school: secondSchool, degree: "硕士", startDate: "2022-09", endDate: "2026-06" },
+    ];
+    const first = orders(["学校：甲大学", "学历：本科", "开始时间：2018-09", "结束时间：2022-06"]);
+    const second = orders([`学校：${secondSchool}`, "学历：硕士", "开始时间：2022-09", "结束时间：2026-06"]);
+    for (const a of first) for (const b of second) for (const separator of ["；", "\n\n"]) {
+      const text = ["教育经历", a.join(separator), b.join(separator)].join("\n\n");
+      for (const existing of [emptyProfile(), { ...emptyProfile(), education: expected }]) {
+        const ambiguous: string[] = [];
+        const suggestions = parseSuggestions(text, existing, (entry) => ambiguous.push(entry));
+        const after = applySuggestions(existing, suggestions.map((s) => ({ ...s, choice: "save" }))).saved;
+        assert.deepEqual(after.education, expected, text);
+        assert.deepEqual(ambiguous, [], text);
+        if (existing.education.length) assert.deepEqual(suggestions, [], text);
+        checked++;
+      }
+    }
+  }
+  assert.equal(checked, 4608);
+});
+
+test("工作与项目经历先检查整行边界，缺标识的后条不会污染前条", () => {
+  for (const { text, group, expected, warning } of [
+    {
+      text: "工作经历\n公司：样本公司；岗位：前端\n成果：后端成果；岗位：后端",
+      group: "experience" as const,
+      expected: [{ company: "样本公司", title: "前端" }],
+      warning: "工作与实习：缺少公司",
+    },
+    {
+      text: "项目经历\n项目名称：项目一；项目角色：开发\n项目介绍：另一项目；项目角色：负责人",
+      group: "projects" as const,
+      expected: [{ name: "项目一", role: "开发" }],
+      warning: "项目经历：缺少项目名称",
+    },
+  ]) {
+    const ambiguous: string[] = [];
+    const suggestions = parseSuggestions(text, emptyProfile(), (entry) => ambiguous.push(entry));
+    assert.deepEqual(applySuggestions(emptyProfile(), suggestions).saved[group], expected);
+    assert.deepEqual(ambiguous, [warning]);
+  }
+});
+
 test("同公司不同岗位、同名项目按经历身份匹配", () => {
   const original = emptyProfile();
   original.experience = [

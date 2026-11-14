@@ -300,9 +300,9 @@ export function parseSuggestions(
       continue;
     }
     const pieces = line.split(/[；;|｜]/).map((p) => p.trim());
-    for (const piece of pieces) {
-      const match = piece.match(/^([^：:]{1,20})[：:]\s*(.+)$/);
-      if (!match) continue;
+    const fields = pieces.flatMap((piece) => {
+      const match = piece.match(/^([^：:]{1,20})[：:]\s*(.*)$/);
+      if (!match) return [];
       const key = match[1].trim();
       const value = match[2].trim();
       const field = group.fields.find(
@@ -312,12 +312,16 @@ export function parseSuggestions(
           (key === "电话" && f.key === "phone") ||
           (key === "技术" && f.key === "technology"),
       );
-      if (!field) continue;
+      return field ? [{ field, value }] : [];
+    });
+    // 先检查整行，避免“专业…；学历…”的新条目前缀被拼入上一条。
+    if (
+      group.repeat &&
+      fields.some(({ field }) => entry.some((item) => item.field === field))
+    ) flush();
+    for (const { field, value } of fields) {
       if (group.repeat) {
-        if (
-          field === group.fields[0] &&
-          entry.some((item) => item.field === field)
-        ) flush();
+        if (entry.some((item) => item.field === field)) flush();
         entry.push({ field, value, evidence: original });
       } else add(group, field, value, original);
     }
