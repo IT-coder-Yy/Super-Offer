@@ -1,0 +1,13 @@
+:root {
+  --font: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  --canvas: #f8f9f5;
+  --paper: #fffefa;
+  --sidebar: #f0f3ed;
+  --ink: #25392f;
+  --muted: #66736b;
+  --accent: #35634c;
+  --focus: #75a78c;
+  --amber: #b39449;
+  --line: #dfe5db;
+  --line-strong: #c3cec3;
+}

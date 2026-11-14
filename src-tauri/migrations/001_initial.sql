@@ -1,0 +1,16 @@
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta VALUES ('revision', '0');
+CREATE TABLE assets (id TEXT PRIMARY KEY, data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, current_version_id TEXT NOT NULL REFERENCES profile_versions(id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE profile_versions (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES profiles(id) DEFERRABLE INITIALLY DEFERRED, resume_asset_id TEXT REFERENCES assets(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE applications (id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), profile_version_id TEXT REFERENCES profile_versions(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE events (id TEXT PRIMARY KEY, application_id TEXT NOT NULL REFERENCES applications(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE interviews (id TEXT PRIMARY KEY, application_id TEXT NOT NULL REFERENCES applications(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE providers (id TEXT PRIMARY KEY CHECK(id IN ('chat','asr')), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE operations (id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, result TEXT NOT NULL CHECK(json_valid(result)));
+CREATE INDEX profile_versions_owner ON profile_versions(profile_id);
+CREATE INDEX events_application ON events(application_id);
+CREATE INDEX interviews_application ON interviews(application_id);
+PRAGMA user_version = 1;
