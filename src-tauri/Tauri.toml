@@ -1,0 +1,27 @@
+productName = "Super-Offer"
+version = "0.1.0"
+identifier = "io.superoffer.desktop"
+
+[build]
+beforeDevCommand = "npm run dev"
+devUrl = "http://127.0.0.1:1420"
+beforeBuildCommand = "npm run build"
+frontendDist = "../dist"
+
+[app]
+withGlobalTauri = false
+
+[[app.windows]]
+label = "main"
+title = "Super-Offer"
+width = 1240
+height = 820
+minWidth = 900
+minHeight = 620
+
+[app.security]
+csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'"
+
+[bundle]
+active = false
+icon = ["../.s0-work/icons/icon.png", "../.s0-work/icons/icon.ico", "../.s0-work/icons/icon.icns"]
