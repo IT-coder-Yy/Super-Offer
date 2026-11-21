@@ -48,8 +48,18 @@ async function supplement(name) {
 async function record(name, version, license, folder, source) {
   const names = await readdir(folder);
   const files = names.filter((name) =>
-    /^(licen[sc]e|copying|notice|copyright)([.\-_]|$)/i.test(name),
+    /^(licen[sc]e|copying|notice|copyright)([.\-_]|$)/i.test(name) || /third.*notices/i.test(name),
   );
+  if (name === "playwright-core") {
+    async function bundled(directory) {
+      for (const entry of await readdir(join(folder, directory), { withFileTypes: true })) {
+        const relative = `${directory}/${entry.name}`;
+        if (entry.isDirectory()) await bundled(relative);
+        else if (entry.isFile() && /(?:license|licence|notice|copyright)/i.test(entry.name)) files.push(relative);
+      }
+    }
+    await bundled("lib");
+  }
   const texts = [];
   for (const file of files) {
     try {
@@ -141,6 +151,12 @@ for (const item of metadata.packages.filter(
     item.repository || item.source,
   );
 records.sort((a, b) => a.name.localeCompare(b.name));
+records.push({
+  name: "Node.js", version: "24.14.1", license: "MIT及随包文件列明的第三方许可",
+  source: "https://nodejs.org/dist/v24.14.1/",
+  files: ["NODE-LICENSE.txt"],
+  text: await readFile(".s0-work/browser-runtime/NODE-LICENSE.txt", "utf8"),
+});
 const apache = await readFile("node_modules/pdfjs-dist/LICENSE", "utf8");
 const unresolved = records.filter(
   (item) => !item.text && !item.license.includes("Apache-2.0"),
