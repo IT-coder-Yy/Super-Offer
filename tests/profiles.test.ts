@@ -15,6 +15,19 @@ import {
 } from "../src/profile-fields.ts";
 import { filterApplications, stageCounts } from "../src/dashboard.ts";
 
+test("分组手机号保留原文依据，同号重导入不重复，多个号码留待人工选择", () => {
+  const original = "(+86) 138-0000-0000";
+  const phone = (text: string, existing = emptyProfile()) =>
+    parseSuggestions(text, existing).filter((item) => item.path === "basic.phone");
+  const [suggestion] = phone(original + "\n138 0000 0000");
+  assert.equal(suggestion.value, "13800000000");
+  assert.equal(suggestion.evidence, original);
+  const saved = applySuggestions(emptyProfile(), [suggestion]).saved;
+  assert.deepEqual(phone("138 0000 0000", saved), []);
+  assert.deepEqual(phone(original + "\n13700000000"), []);
+  assert.deepEqual(phone("138-0000\n0000"), []);
+});
+
 test("字段覆盖、标签提取和多条经历；没有依据的姓名与经历不生成", () => {
   assert.deepEqual(
     FIELD_GROUPS.map((g) => g.key),

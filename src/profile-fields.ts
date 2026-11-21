@@ -330,16 +330,19 @@ export function parseSuggestions(
   const basic = FIELD_GROUPS[0];
   for (const [key, regex] of [
     ["email", /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi],
-    ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g],
+    ["phone", /(?<!\d)1[3-9]\d(?:[\t \u00a0-]?\d{4}){2}(?!\d)/g],
   ] as const) {
-    const matches = [...new Set(text.match(regex) ?? [])];
-    if (matches.length === 1)
-      add(
-        basic,
-        basic.fields.find((f) => f.key === key)!,
-        matches[0],
-        text.split(/\r?\n/).find((l) => l.includes(matches[0])) ?? matches[0],
-      );
+    const candidates = new Map<string, string>();
+    for (const line of text.split(/\r?\n/)) {
+      for (const raw of line.match(regex) ?? []) {
+        const value = key === "phone" ? raw.replace(/\D/g, "") : raw;
+        if (!candidates.has(value)) candidates.set(value, line);
+      }
+    }
+    if (candidates.size === 1) {
+      const [[value, evidence]] = candidates;
+      add(basic, basic.fields.find((f) => f.key === key)!, value, evidence);
+    }
   }
   return suggestions;
 }
