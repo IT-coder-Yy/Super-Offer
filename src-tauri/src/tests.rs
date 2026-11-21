@@ -707,6 +707,32 @@ fn input(purpose: Purpose, stream: bool) -> TaskInput {
         versions: vec![],
     }
 }
+#[tokio::test]
+async fn changed_interview_provider_is_rejected_before_creating_or_sending_a_task() {
+    let (_dir, store) = fixture();
+    let runtime = Runtime::new(store, Arc::new(MemoryVault::default()), Arc::new(|_| {}));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/chat", listener.local_addr().unwrap());
+    let original = provider(&runtime, Purpose::Chat, &url);
+    let dataset = runtime.lock().unwrap().dataset_id.clone();
+    let mut update = provider_update(&original, None, false);
+    update.model = "updated-fixture-model".into();
+    runtime.save_provider(&dataset, update).unwrap();
+    let error = runtime
+        .start_with_provider(
+            &dataset,
+            input(Purpose::Chat, true),
+            Some(&original.version),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "PROVIDER_CHANGED");
+    assert!(runtime.lock().unwrap().snapshot().unwrap().tasks.is_empty());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
 fn server(
     status: &str,
     content_type: &str,
