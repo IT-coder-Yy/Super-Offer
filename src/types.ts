@@ -147,6 +147,7 @@ export interface Snapshot {
   tasks: ModelTask[];
 }
 export interface Workspace {
+  activity: { browser: boolean; source: boolean; interview: boolean };
   state: Snapshot;
   providerStatus: {
     purpose: Purpose;
