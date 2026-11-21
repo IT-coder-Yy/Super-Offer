@@ -5,8 +5,11 @@ import { ApplicationsPanel } from "./ApplicationsPanel";
 import { ProfilePanel } from "./ProfilePanel";
 import { ModelPanel } from "./ModelPanel";
 import { BackupPanel } from "./BackupPanel";
+import { BrowserPanel } from "./BrowserPanel";
+import { ProjectsPanel } from "./ProjectsPanel";
+import { InterviewPanel } from "./InterviewPanel";
 import { Dialog } from "./ui";
-import type { Workspace } from "./types";
+import type { ProfileData, Workspace } from "./types";
 
 const navigation = [
   {
@@ -27,6 +30,9 @@ const navigation = [
     symbol: "◇",
     description: "由你选择服务，掌握每一次调用。",
   },
+  { id: "browser", name: "浏览器填写", symbol: "▣", description: "连接现有浏览器，核对每一步填写。" },
+  { id: "projects", name: "项目材料", symbol: "⌘", description: "只读保存项目，为回答保留依据。" },
+  { id: "interview", name: "文字面试", symbol: "◌", description: "围绕岗位和项目练习，按证据改进回答。" },
   {
     id: "backup",
     name: "数据备份",
@@ -45,6 +51,10 @@ export function App() {
   const [profileDirty, setProfileDirty] = useState(false);
   const [applicationDirty, setApplicationDirty] = useState(false);
   const [modelDirty, setModelDirty] = useState(false);
+  const [browserDirty, setBrowserDirty] = useState(false);
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const [interviewDirty, setInterviewDirty] = useState(false);
+  const [profileSelection, setProfileSelection] = useState<{versionId: string; data: ProfileData} | null>(null);
   const [closeOpen, setCloseOpen] = useState(false);
   const workspaceRef = useRef<Workspace | null>(null);
   const reloadQueue = useRef<Promise<void>>(Promise.resolve());
@@ -62,6 +72,10 @@ export function App() {
         setProfileDirty(false);
         setApplicationDirty(false);
         setModelDirty(false);
+        setBrowserDirty(false);
+        setSourceDirty(false);
+        setInterviewDirty(false);
+        setProfileSelection(null);
       }
       workspaceRef.current = next;
       setWorkspace(next);
@@ -77,10 +91,11 @@ export function App() {
   useEffect(() => {
     void reload().catch((e) => setFailure(errorOf(e).message));
   }, [reload]);
-  const hasUnsavedEdits = profileDirty || applicationDirty || modelDirty;
+  const hasUnsavedEdits = profileDirty || applicationDirty || modelDirty || browserDirty || sourceDirty || interviewDirty;
   const guarded = useRef(false);
   guarded.current =
     hasUnsavedEdits ||
+    !!workspace && Object.values(workspace.activity).some(Boolean) ||
     !!workspace?.state.tasks.some((t) => t.status === "running");
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -139,14 +154,17 @@ export function App() {
               {item.name}
               {((item.id === "profiles" && profileDirty) ||
                 (item.id === "applications" && applicationDirty) ||
-                (item.id === "models" && modelDirty)) && (
+                (item.id === "models" && modelDirty) ||
+                (item.id === "browser" && browserDirty) ||
+                (item.id === "projects" && sourceDirty) ||
+                (item.id === "interview" && interviewDirty)) && (
                 <i aria-label="有未保存编辑" />
               )}
             </button>
           ))}
         </nav>
         <div className="sidebar-foot">
-          <span className="local-dot" /> 本地保存<small>S1 · 基础工作区</small>
+          <span className="local-dot" /> 本地保存<small>资料、投递与面试</small>
         </div>
       </aside>
       <main>
@@ -207,6 +225,7 @@ export function App() {
                 reload={reload}
                 notify={notify}
                 onDirty={setProfileDirty}
+                onSelection={setProfileSelection}
               />
             </section>
             <section hidden={tab !== "models"}>
@@ -216,6 +235,15 @@ export function App() {
                 notify={notify}
                 onDirty={setModelDirty}
               />
+            </section>
+            <section hidden={tab !== "browser"}>
+              <BrowserPanel workspace={workspace} reload={reload} notify={notify} onDirty={setBrowserDirty} profileSelection={profileSelection} />
+            </section>
+            <section hidden={tab !== "projects"}>
+              <ProjectsPanel workspace={workspace} reload={reload} notify={notify} onDirty={setSourceDirty} />
+            </section>
+            <section hidden={tab !== "interview"}>
+              <InterviewPanel workspace={workspace} reload={reload} notify={notify} onDirty={setInterviewDirty} />
             </section>
             <section hidden={tab !== "backup"}>
               <BackupPanel
@@ -251,7 +279,7 @@ export function App() {
           }
         >
           <p>
-            未保存编辑会丢失。正在运行的模型任务会停止，已经收到的内容继续保留。
+            未保存编辑会丢失。填写、项目导入和模型任务会停止，已经保存的回答与结果继续保留。
           </p>
         </Dialog>
       )}
