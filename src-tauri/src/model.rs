@@ -15,6 +15,25 @@ use std::{
 use zeroize::Zeroizing;
 
 type Observer = Arc<dyn Fn(&ModelTask) + Send + Sync>;
+fn validate_versions(conn: &rusqlite::Connection, versions: &[VersionRef]) -> Result<()> {
+    for reference in versions {
+        match reference.kind.as_str() {
+            "profile_version" => {
+                let _: ProfileVersion = get(conn, "profile_versions", &reference.id)?;
+            }
+            "job_snapshot" => {
+                let _: JobSnapshot = get(conn, "jobs", &reference.id)?;
+            }
+            "asset" => {
+                let _: FileAsset = get(conn, "assets", &reference.id)?;
+            }
+            _ if crate::source::validate_reference(conn, &reference.kind, &reference.id)?
+                || crate::interview::validate_reference(conn, &reference.kind, &reference.id)? => {}
+            _ => return Err(AppError::invalid("不支持的输入版本类型。")),
+        }
+    }
+    Ok(())
+}
 pub struct Runtime {
     pub store: Mutex<Store>,
     pub vault: Arc<dyn Vault>,
@@ -174,6 +193,7 @@ impl Runtime {
                 bump(&tx)?;
                 tx.commit()?;
             }
+            store.withhold_simulation_output(std::slice::from_mut(&mut task))?;
             task
         };
         if let Ok(mut workers) = self.workers.lock()
@@ -199,6 +219,14 @@ impl Runtime {
         Ok(())
     }
     pub fn start(self: &Arc<Self>, dataset: &str, input: TaskInput) -> Result<ModelTask> {
+        self.start_with_provider(dataset, input, None)
+    }
+    pub(crate) fn start_with_provider(
+        self: &Arc<Self>,
+        dataset: &str,
+        input: TaskInput,
+        expected_version: Option<&str>,
+    ) -> Result<ModelTask> {
         text(&input.context_id, "任务上下文", true, 200)?;
         text(
             &input.text,
@@ -216,25 +244,17 @@ impl Runtime {
             }
             let provider: ProviderConfig = get(&store.conn, "providers", input.purpose.key())
                 .map_err(|_| AppError::new("CONFIG_REQUIRED", "请先保存对应服务配置。"))?;
+            if expected_version.is_some_and(|version| version != provider.version) {
+                return Err(AppError::new(
+                    "PROVIDER_CHANGED",
+                    "聊天配置已改变，请确认本场使用的服务与外发范围后再继续。",
+                ));
+            }
             provider.validate()?;
             let key = Zeroizing::new(self.vault.get(&Self::slot(&store, &provider))?.ok_or_else(
                 || AppError::new("KEY_REQUIRED", "此服务尚未配置 Key，请在设置中填写。"),
             )?);
-            for reference in &input.versions {
-                match reference.kind.as_str() {
-                    "profile_version" => {
-                        let _: ProfileVersion =
-                            get(&store.conn, "profile_versions", &reference.id)?;
-                    }
-                    "job_snapshot" => {
-                        let _: JobSnapshot = get(&store.conn, "jobs", &reference.id)?;
-                    }
-                    "asset" => {
-                        let _: FileAsset = get(&store.conn, "assets", &reference.id)?;
-                    }
-                    _ => return Err(AppError::invalid("不支持的输入版本类型。")),
-                }
-            }
+            validate_versions(&store.conn, &input.versions)?;
             let audio = if input.purpose == Purpose::Asr {
                 let (asset, bytes) = store.read_asset(
                     input
@@ -292,7 +312,11 @@ impl Runtime {
         (self.observer)(&task);
         let runtime = Arc::clone(self);
         let running = task.clone();
+        let (ready, registered) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(async move {
+            if registered.await.is_err() {
+                return;
+            }
             if let Err(error) = runtime.request(&running, input, key, audio).await {
                 let _ = runtime.change_task(&running, |task| {
                     task.status = "failed".into();
@@ -307,6 +331,14 @@ impl Runtime {
         if let Ok(mut workers) = self.workers.lock() {
             workers.retain(|_, h| !h.is_finished());
             workers.insert(task.id.clone(), worker);
+            let _ = ready.send(());
+        } else {
+            worker.abort();
+            let _ = self.cancel(dataset, &task.id);
+            return Err(AppError::new(
+                "TASK_FAILED",
+                "任务工作器不可用，尚未发起网络请求。",
+            ));
         }
         Ok(task)
     }
@@ -315,7 +347,7 @@ impl Runtime {
         identity: &ModelTask,
         change: impl FnOnce(&mut ModelTask),
     ) -> Result<bool> {
-        let updated = {
+        let (updated, allowed) = {
             let mut store = self.lock()?;
             if store.dataset_id != identity.dataset_id {
                 return Ok(false);
@@ -324,16 +356,33 @@ impl Runtime {
             if task.generation != identity.generation || task.status != "running" {
                 return Ok(false);
             }
-            change(&mut task);
+            // 固定材料在发起前已校验。流式接收时只需复核可被撤回的授权。
+            let validation = task
+                .versions
+                .iter()
+                .filter(|reference| reference.kind == "source_scope")
+                .try_for_each(|reference| {
+                    crate::source::validate_reference(&store.conn, &reference.kind, &reference.id)
+                        .map(|_| ())
+                });
+            let allowed = validation.is_ok();
+            if let Err(error) = validation {
+                task.status = "cancelled".into();
+                task.progress = "输入依据或授权已变化，任务停止，已有内容保留。".into();
+                task.error = Some(error);
+            } else {
+                change(&mut task);
+            }
             task.updated_at = now();
             let tx = store.conn.transaction()?;
             put(&tx, "tasks", &task.id, &task)?;
             bump(&tx)?;
             tx.commit()?;
-            task
+            store.withhold_simulation_output(std::slice::from_mut(&mut task))?;
+            (task, allowed)
         };
         (self.observer)(&updated);
-        Ok(true)
+        Ok(allowed)
     }
     async fn request(
         &self,
@@ -383,6 +432,9 @@ impl Runtime {
                 body["stream_options"] = json!({"include_usage":true});
             }
             request = request.json(&body);
+        }
+        if !self.change_task(identity, |_| {})? {
+            return Ok(());
         }
         let response = request.send().await.map_err(network_error)?;
         let status = response.status().as_u16();

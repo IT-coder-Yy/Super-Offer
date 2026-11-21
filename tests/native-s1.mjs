@@ -1,6 +1,7 @@
 import { chromium } from "playwright-core";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, writeFile, readFile, rename, unlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createServer as httpServer } from "node:http";
 import { resolve, join } from "node:path";
@@ -16,6 +17,20 @@ const executable = resolve(
   process.env.SUPER_OFFER_TEST_EXE ||
     ".s0-work/tauri-target/debug/super-offer.exe",
 );
+const buildEvidence = {
+  platform: process.platform,
+  arch: process.arch,
+  nodeVersion: process.version,
+  files: await Promise.all([
+    executable, "tests/native-s1.mjs", "tests/fixtures.mjs", "src/App.tsx",
+    "src/ProfilePanel.tsx", "src/resume-parser.ts", "src/BackupPanel.tsx",
+    "src-tauri/src/desktop.rs", "src-tauri/src/store.rs", "src-tauri/src/backup.rs",
+    "src-tauri/Cargo.lock",
+  ].map(async (path) => ({
+    path: resolve(path),
+    sha256: createHash("sha256").update(await readFile(path)).digest("hex"),
+  }))),
+};
 const results = [],
   errors = [];
 let browser, page, child;
@@ -308,7 +323,7 @@ try {
       await page.getByLabel("姓名", { exact: true }).inputValue(),
       "合成求职者",
     );
-    await page.getByLabel("现居城市").fill("杭州");
+    await page.getByLabel("现居城市", { exact: true }).fill("杭州");
     await bButton.click();
     await page.getByRole("button", { name: "保存并切换" }).click();
     await poll(
@@ -324,7 +339,7 @@ try {
         ).includes("样本 A"),
       "档案 A 尚未选中",
     );
-    assert.equal(await page.getByLabel("现居城市").inputValue(), "杭州");
+    assert.equal(await page.getByLabel("现居城市", { exact: true }).inputValue(), "杭州");
     await page.getByLabel("档案名称").fill("");
     await bButton.click();
     await page.getByRole("button", { name: "保存并切换" }).click();
@@ -637,7 +652,7 @@ try {
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.screenshot({ path: join(root, "profiles.png") });
   });
-  await step("AC36：取消恢复不改变数据，确认后先备份再整体替换", async () => {
+  await step("AC36：原生恢复接口的取消、坏包和预备份失败保全，确认后整体替换", async () => {
     const state = await snapshot();
     await invoke("mutate", {
       datasetId: state.datasetId,
@@ -648,21 +663,40 @@ try {
         name: "恢复后不应合并的档案",
       },
     });
-    await tab("数据备份");
-    await page.getByLabel("选择 Super-Offer 备份").setInputFiles(exported);
-    await page.getByRole("dialog", { name: "核对整体恢复范围" }).waitFor();
-    await page.getByRole("button", { name: "取消恢复", exact: true }).click();
-    assert.equal((await snapshot()).profiles.length, 3);
-    await page.getByLabel("选择 Super-Offer 备份").setInputFiles(exported);
-    await page.getByRole("dialog", { name: "核对整体恢复范围" }).waitFor();
-    await page.screenshot({
-      path: join(root, "restore-preview.png"),
-      fullPage: true,
+    // 原生文件对话框另行验收；这里验证生产 IPC 与真实备份文件。
+    const bytes = Array.from(await readFile(exported));
+    const beforeRestore = await snapshot();
+    let preview = await invoke("restore_preview", { bytes });
+    assert.equal(preview.manifest.counts.profiles, 2);
+    assert.equal(preview.currentCounts.profiles, 3);
+    await invoke("restore_cancel");
+    assert.deepEqual(await snapshot(), beforeRestore);
+    await assert.rejects(invoke("restore_preview", { bytes: [0, 1, 2, 3] }));
+    assert.deepEqual(await snapshot(), beforeRestore);
+    preview = await invoke("restore_preview", { bytes });
+    assert.equal(
+      resolve((await invoke("snapshot")).dataDirectory),
+      resolve(root, "data"),
+    );
+    const backups = join(root, "data", "backups");
+    const savedBackups = join(root, "data", "backups-before-failure");
+    await rename(backups, savedBackups);
+    try {
+      await writeFile(backups, "合成预备份失败样本");
+      await assert.rejects(invoke("restore_commit", {
+        token: preview.token, confirmed: true, hasUnsavedEdits: false,
+      }));
+      assert.deepEqual(await snapshot(), beforeRestore);
+    } finally {
+      await unlink(backups);
+      await rename(savedBackups, backups);
+    }
+    preview = await invoke("restore_preview", { bytes });
+    const receipt = await invoke("restore_commit", {
+      token: preview.token, confirmed: true, hasUnsavedEdits: false,
     });
-    await page.getByLabel("我已核对范围，确认整体替换当前工作区").check();
-    await page
-      .getByRole("button", { name: "先备份当前数据并整体恢复", exact: true })
-      .click();
+    assert.equal(receipt.previousBackup.manifest.counts.profiles, 3);
+    assert.ok((await readFile(receipt.previousBackup.path)).length > 0);
     await poll(
       async () => (await snapshot()).datasetId !== expected.datasetId,
       "恢复未完成",
@@ -673,7 +707,7 @@ try {
     assert.deepEqual(actual.applications, expected.applications);
     assert.deepEqual(actual.interviews, expected.interviews);
     assert.equal(actual.assets.length, 3);
-    assert.match(await page.getByRole("status").innerText(), /恢复前备份/);
+    assert.equal(actual.datasetId, receipt.datasetId);
   });
   await step("S1-08：恢复后再次重启仍为同一套完整数据", async () => {
     const before = await snapshot();
@@ -905,6 +939,7 @@ try {
     JSON.stringify(
       {
         status: "通过",
+        ...buildEvidence,
         executable,
         webviewVersion: await browser.version(),
         root,
@@ -934,6 +969,7 @@ try {
     JSON.stringify(
       {
         status: "失败",
+        ...buildEvidence,
         executable,
         root,
         results,

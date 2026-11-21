@@ -28,8 +28,9 @@ interface Props {
   reload: () => Promise<Workspace>;
   notify: (message: string, error?: boolean) => void;
   onDirty: (dirty: boolean) => void;
+  onSelection?: (selection: { versionId: string; data: ProfileData } | null) => void;
 }
-export function ProfilePanel({ workspace, reload, notify, onDirty }: Props) {
+export function ProfilePanel({ workspace, reload, notify, onDirty, onSelection }: Props) {
   const state = workspace.state;
   const first = state.profiles[0];
   const initial = first?.versions.find((v) => v.id === first.currentVersionId);
@@ -64,6 +65,11 @@ export function ProfilePanel({ workspace, reload, notify, onDirty }: Props) {
   useEffect(() => {
     onDirty(dirty || !!review || Object.keys(once).length > 0);
   }, [dirty, review, once, onDirty]);
+  useEffect(() => {
+    onSelection?.(base && !dirty && !review && Object.keys(once).length
+      ? { versionId: base.id, data: materializeSelection(base.data, once) }
+      : null);
+  }, [base, dirty, review, once, onSelection]);
   const current = state.profiles.find((p) => p.id === selected);
   const asset = state.assets.find((a) => a.id === data.resumeAssetId);
   const missing = missingGroups(data);

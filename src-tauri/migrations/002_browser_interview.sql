@@ -1,0 +1,10 @@
+CREATE TABLE fill_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE source_versions (id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE source_files (id TEXT PRIMARY KEY, source_version_id TEXT NOT NULL REFERENCES source_versions(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE evidence (id TEXT PRIMARY KEY, source_version_id TEXT NOT NULL REFERENCES source_versions(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE interview_sessions (id TEXT PRIMARY KEY, application_id TEXT REFERENCES applications(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE interview_reports (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES interview_sessions(id), data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE INDEX source_files_version ON source_files(source_version_id);
+CREATE INDEX evidence_version ON evidence(source_version_id);
+CREATE INDEX interview_reports_session ON interview_reports(session_id);
+PRAGMA user_version = 2;

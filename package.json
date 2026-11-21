@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "licenses": "node scripts/collect-licenses.mjs",
-    "assets": "node scripts/prepare-assets.mjs && npm run licenses && tauri icon assets/icon.svg --output .s0-work/icons",
+    "browser:prepare": "node scripts/prepare-browser.mjs",
+    "assets": "node scripts/prepare-assets.mjs && npm run browser:prepare && npm run licenses && tauri icon assets/icon.svg --output .s0-work/icons",
     "dev": "npm run assets && vite --host 127.0.0.1",
     "build": "npm run assets && tsc --noEmit && vite build",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:browser": "node --test --test-concurrency=1 tests/*.test.mjs",
     "desktop": "tauri dev",
     "desktop:build": "tauri build --no-bundle"
   },
@@ -16,6 +18,7 @@
     "@tauri-apps/api": "2.12.4",
     "mammoth": "1.13.0",
     "pdfjs-dist": "6.5.438",
+    "playwright-core": "1.65.0",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
@@ -24,7 +27,6 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.3.0",
-    "playwright-core": "1.65.0",
     "typescript": "7.0.2",
     "vite": "8.3.8"
   }
