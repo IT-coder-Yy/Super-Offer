@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { errorOf, fileBytes, request } from "./api";
+import { errorOf, request } from "./api";
 import type { BackupReceipt, RestorePreview, Workspace } from "./types";
 import { Dialog, Field, formatDate, bytesLabel } from "./ui";
 
@@ -20,6 +20,12 @@ const countNames: Record<string, string> = {
   providers: "服务配置",
   tasks: "模型任务",
   operations: "已保存操作",
+  fill_runs: "填写记录",
+  source_versions: "项目材料版本",
+  source_files: "项目文件清单",
+  evidence: "引用证据",
+  interview_sessions: "文字面试场次",
+  interview_reports: "面试报告",
 };
 export function BackupPanel({
   workspace,
@@ -28,12 +34,13 @@ export function BackupPanel({
   hasUnsavedEdits,
 }: Props) {
   const [audio, setAudio] = useState(false);
+  const [source, setSource] = useState(false);
   const [receipt, setReceipt] = useState<BackupReceipt | null>(null);
   const [preview, setPreview] = useState<RestorePreview | null>(null);
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [licenses, setLicenses] = useState<string | null>(null);
-  const running = workspace.state.tasks.some((t) => t.status === "running");
+  const running = workspace.state.tasks.some((t) => t.status === "running") || Object.values(workspace.activity).some(Boolean);
   async function cancelPreview() {
     try {
       await request("restore_cancel");
@@ -97,6 +104,7 @@ export function BackupPanel({
           />
           包含已导入的测试音频副本
         </label>
+        <label className="check"><input type="checkbox" checked={source} onChange={e => setSource(e.target.checked)} />包含完整项目副本（已保存引用和报告始终保留）</label>
         {hasUnsavedEdits && (
           <p className="notice">有未保存编辑。备份仅包含已保存版本。</p>
         )}
@@ -108,7 +116,7 @@ export function BackupPanel({
             try {
               const result = await request<BackupReceipt>("backup_create", {
                 includeAudio: audio,
-                includeSource: false,
+                includeSource: source,
               });
               setReceipt(result);
               notify("备份已生成并通过完整性校验。");
@@ -154,34 +162,24 @@ export function BackupPanel({
         {(hasUnsavedEdits || running) && (
           <p className="notice">
             {hasUnsavedEdits ? "请先保存或放弃未保存编辑。" : ""}
-            {running ? "请先停止正在运行的模型任务。" : ""}
+            {running ? "请先停止正在运行的填写、导入或面试任务。" : ""}
           </p>
         )}
         <Field label="选择 Super-Offer 备份">
-          <input
-            type="file"
-            accept=".superoffer"
+          <button className="secondary" type="button"
             disabled={busy || hasUnsavedEdits || running}
-            onChange={async (e) => {
-              const input = e.currentTarget;
-              const file = input.files?.[0];
-              if (!file) return;
+            onClick={async () => {
               setBusy(true);
               try {
-                const result = await request<RestorePreview>(
-                  "restore_preview",
-                  { bytes: await fileBytes(file, 256 * 1024 * 1024) },
-                );
-                setPreview(result);
-                setConfirmed(false);
+                const result = await request<RestorePreview | null>("restore_select");
+                if (result) { setPreview(result); setConfirmed(false); }
               } catch (error) {
                 notify(errorOf(error).message, true);
               } finally {
-                input.value = "";
                 setBusy(false);
               }
             }}
-          />
+          >选择备份文件</button>
         </Field>
       </section>
       <section className="settings-section">
