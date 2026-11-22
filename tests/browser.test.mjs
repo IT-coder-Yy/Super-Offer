@@ -333,6 +333,172 @@ test("R18 上一项触发表单沿用同一控件改题，自动填写不把本�
   assert.deepEqual(actual, { value: "", status: "pending", path: null, tail: profile().data.basic.github });
 });
 
+for (const automatic of [false, true]) {
+  test("R18 合法下一步延迟六百毫秒后仍在同岗，并可继续填写 " + (automatic ? "自动" : "手动"), async (t) => {
+    const { page, connection } = await setup(t, profile(), "/#/jobs/fixture/step/1");
+    await page.locator("form").evaluate((form) => {
+      form.innerHTML = '<label>姓名<input></label><button type="button">下一步</button>';
+      form.querySelector("button").onclick = () => setTimeout(() => {
+        location.hash = "/jobs/fixture/step/2";
+        form.innerHTML = '<label>GitHub<input id="tail"></label><button type="submit">最终提交申请</button>';
+      }, 600);
+    });
+    const first = connection.documentId;
+    if (automatic) { await connection.fill("full", true); await connection.job; }
+    else { await fill(connection); await connection.advance(false); }
+    await page.waitForURL("**/step/2");
+    await until(() => (!connection.context && connection.message.includes("离开")) ||
+      connection.context && connection.documentId !== first, "应识别实际发生的慢跨步");
+    if (!automatic && connection.context) await fill(connection);
+    if (automatic && connection.context) await until(async () => !!await page.locator("#tail").inputValue(), "自动填写应接续");
+    const actual = { mounted: !!connection.context, value: await page.locator("#tail").inputValue(), final: await page.evaluate(() => window.submissions) };
+    t.diagnostic(JSON.stringify(actual));
+    assert.deepEqual(actual, { mounted: true, value: profile().data.basic.github, final: 0 });
+  });
+}
+
+test("R18 表内真实章节锚点保留浮框、归属和任务，非表单目标仍撤权", async (t) => {
+  const { page, connection } = await setup(t);
+  await fill(connection);
+  const original = connection.documentId, generation = connection.generation;
+  await page.locator("form").evaluate((form) => {
+    form.insertAdjacentHTML("afterbegin", '<a href="#education">教育章节</a><a href="#outside">表外页面</a>');
+    form.insertAdjacentHTML("afterend", '<section id="outside">其他页面</section>');
+  });
+  await page.getByRole("link", { name: "教育章节" }).click();
+  await page.waitForURL("**/#education");
+  const active = (await connection.inspect().catch(() => [])).find((f) => f.path === "basic.name");
+  const inside = { panel: await page.locator("#super-offer-controls").count(), same: original === connection.documentId && generation === connection.generation, owned: active?.owned || false };
+  await page.getByRole("link", { name: "表外页面" }).click();
+  await page.waitForURL("**/#outside");
+  await until(() => !connection.context, "不把表外目标当作申请表章节");
+  const actual = { ...inside, outside: !!connection.context };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { panel: 1, same: true, owned: true, outside: false });
+});
+
+test("R18 不依赖岗位网址格式，慢的站内整页下一步仍能继续", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>姓名<input></label><button type="button">下一步</button>';
+    form.querySelector("button").onclick = () => setTimeout(() => { location.href = "/step2?flow=synthetic"; }, 680);
+  });
+  await fill(connection);
+  const before = connection.documentId;
+  await connection.advance(false);
+  await page.waitForURL("**/step2?flow=synthetic");
+  await until(() => (!connection.context && connection.message.includes("离开")) || connection.context && connection.documentId !== before, "等候新步骤");
+  if (connection.context) await fill(connection);
+  const actual = { mounted: !!connection.context, tail: await page.locator("#tail").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { mounted: true, tail: profile().data.basic.github });
+});
+
+test("等待下一步时本人用地址栏打开同站另一岗位仍撤权", async (t) => {
+  const { page, connection } = await setup(t, profile(), "/#/jobs/a/step/1");
+  await page.locator("form").evaluate((form) => { form.innerHTML = '<label>姓名<input></label><button type="button">下一步</button>'; });
+  await connection.advance(false);
+  await page.goto(server.url + "/#/jobs/b/step/2");
+  await until(() => !connection.context && connection.message.includes("离开"), "地址栏另选申请不能接入旧流程");
+  assert.equal(await page.locator("input").inputValue(), "");
+  assert.equal(await page.locator("#super-offer-controls").count(), 0);
+});
+
+test("R18 相邻 网站脚本把下一步导向另一岗位，浮框撤下且新表不写入", async (t) => {
+  const routes = [
+    ["/#/jobs/a/step/1", "/#/jobs/b/step/2"],
+    ["/campus/position/101/detail", "/campus/position/202/detail"],
+    ["/recruit/e/#/official/trainee/job-info/33086", "/recruit/e/#/official/trainee/job-info/33087"],
+    ["/apply?job_id=post-a&step=1", "/apply?jobId=post-b&step=2"],
+    ["/ats/#/apply?positionId=role-a&step=1", "/ats/#/apply?positionId=role-b&step=2"],
+    ["/apply?jobCode=A42631&batch=synthetic", "/apply?job_code=B99771&batch=synthetic"],
+  ];
+  const observed = [];
+  for (const [source, destination] of routes) {
+    const { page, connection } = await setup(t, profile(), source);
+    const before = connection.documentId;
+    await page.locator("form").evaluate((form, path) => {
+      form.innerHTML = '<label>姓名<input></label><button type="button">下一步</button>';
+      form.querySelector("button").onclick = () => setTimeout(() => {
+        history.pushState({}, "", path);
+        form.innerHTML = '<label>GitHub<input id="other-job"></label><button type="submit">最终提交申请</button>';
+      }, 350);
+    }, destination);
+    await connection.fill("full", true);
+    await connection.job;
+    await page.waitForURL((url) => url.href === new URL(destination, server.url).href);
+    await until(async () => !connection.context && connection.message.includes("离开") ||
+      connection.documentId !== before && !!await page.locator("#other-job").inputValue(), "等候脚本切岗后的实际页面");
+    observed.push({ mounted: !!connection.context, panel: await page.locator("#super-offer-controls").count(),
+      value: await page.locator("#other-job").inputValue(), submitted: await page.evaluate(() => window.submissions) });
+  }
+  t.diagnostic(JSON.stringify({ routes: observed }));
+  assert.deepEqual(observed, routes.map(() => ({ mounted: false, panel: 0, value: "", submitted: 0 })));
+});
+
+test("R18 相邻 同一岗位经无编号中间步骤仍正常填写，再转另一岗位才撤权", async (t) => {
+  const { page, connection } = await setup(t, profile(), "/apply?positionId=stable-a");
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>姓名<input></label><button id="next" type="button">下一步</button>';
+    form.querySelector("button").onclick = () => setTimeout(() => {
+      history.pushState({}, "", "/generic-stage");
+      form.innerHTML = '<label>GitHub<input id="tail"></label><button id="continue" type="button">下一步</button>';
+      form.querySelector("button").onclick = () => setTimeout(() => {
+        history.pushState({}, "", "/jobs/different-b/step/3");
+        form.innerHTML = '<label>姓名<input id="other-job"></label><button type="submit">最终提交申请</button>';
+      }, 360);
+    }, 360);
+  });
+  await fill(connection);
+  const first = connection.documentId;
+  await connection.advance(false);
+  await page.waitForURL("**/generic-stage");
+  await until(() => connection.context && first !== connection.documentId, "无标识的站点下一步仍可处理");
+  await fill(connection);
+  const generic = await page.locator("#tail").inputValue(), prior = connection.documentId;
+  await connection.fill("full", true);
+  await connection.job;
+  await page.waitForURL("**/jobs/different-b/step/3");
+  await until(async () => !connection.context && connection.message.includes("离开") ||
+    prior !== connection.documentId && !!await page.locator("#other-job").inputValue(), "无编号中间步骤不得抹去已选岗位");
+  const actual = { generic, other: await page.locator("#other-job").inputValue(), panel: await page.locator("#super-offer-controls").count() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { generic: profile().data.basic.github, other: "", panel: 0 });
+});
+
+test("同岗在路径与岗位查询参数间切换仍继续，一般批次和表单记录号可变化", async (t) => {
+  const paths = [
+    ["/campus/position/101/detail?jobCode=A1", "/jobs/apply?job_id=101&jobCode=A1&batchId=second"],
+    ["/apply?batchId=first&id=form-1", "/apply?batchId=second&id=form-2"],
+  ];
+  for (const [source, destination] of paths) {
+    const { page, connection } = await setup(t, profile(), source);
+    const original = connection.documentId;
+    await page.locator("form").evaluate((form, path) => {
+      form.innerHTML = '<label>姓名<input></label><button type="button">下一步</button>';
+      form.querySelector("button").onclick = () => setTimeout(() => {
+        history.pushState({}, "", path);
+        form.innerHTML = '<label>GitHub<input id="tail"></label><button type="submit">最终提交申请</button>';
+      }, 320);
+    }, destination);
+    await connection.fill("full", true);
+    await connection.job;
+    await page.waitForURL((url) => url.href === new URL(destination, server.url).href);
+    await until(async () => connection.documentId !== original && !!await page.locator("#tail").inputValue(), "已确认本岗步骤应填写尾项");
+    assert.equal(await page.locator("#tail").inputValue(), profile().data.basic.github);
+    assert.equal(await page.evaluate(() => window.submissions), 0);
+  }
+});
+
+test("岗位位于片段路由时，旧表单中碰巧有同名锚点也不能丢掉岗位地址", async (t) => {
+  const { page, connection } = await setup(t, profile(), "/#/jobs/role-a");
+  await connection.inspect(true);
+  await page.locator("#education").evaluate((el) => el.insertAdjacentHTML("beforebegin", '<a href="#education">切离岗位路由</a>'));
+  await page.getByRole("link", { name: "切离岗位路由" }).click();
+  await until(() => !connection.context && connection.message.includes("离开"), "普通锚点不得继承已经失去的岗位路由");
+  assert.equal(await page.locator("#super-offer-controls").count(), 0);
+});
+
 test("恢复历史清单保留旧版合法的长英文原文，新识别的页面值才取摘要", async (t) => {
   const { page, connection } = await setup(t);
   const target = (await connection.listTargets()).find((item) => connection.targets.get(item.id) === page);

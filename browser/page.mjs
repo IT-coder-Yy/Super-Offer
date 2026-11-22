@@ -1,21 +1,23 @@
 // 此函数只在选定页面的 CDP 隔离世界运行；页面主世界没有业务桥接权限。
 export function installWorld(binding, documentId) {
   globalThis.__superOffer?.dispose();
-  const mountedUrl = location.href;
+  let mountedUrl = location.href;
   const elements = new Map(),
     ids = new WeakMap(),
     owned = new WeakMap(),
     touched = new WeakSet(),
     writes = new Map(),
     validationResults = new Map(),
-    uploadStates = new WeakMap();
+    uploadStates = new WeakMap(),
+    forms = new Set(document.forms);
   let sequence = 0,
     view = { generation: "", status: "ready", profileName: "", profiles: [] },
     writing = false,
     lastTick = Date.now(),
     pendingProfile = null,
     profileRequestSequence = 0,
-    profilesKey = "";
+    profilesKey = "",
+    pendingNext = null;
   const host = document.createElement("aside");
   host.id = "super-offer-controls";
   host.style.cssText =
@@ -183,7 +185,10 @@ export function installWorld(binding, documentId) {
     }
   };
   const onUserClick = (event) => {
-    if (event.isTrusted && event.target !== host && view.status === "running") send("user-navigation");
+    if (event.isTrusted && event.target !== host) {
+      pendingNext = null;
+      if (["running", "waiting"].includes(view.status)) send("user-navigation");
+    }
   };
   document.addEventListener("click", onUserClick, true);
   document.addEventListener("input", onInput, true);
@@ -460,6 +465,7 @@ export function installWorld(binding, documentId) {
     return "";
   };
   const inspect = () => {
+    if (!forms.size) for (const form of document.forms) forms.add(form);
     const reason = loginReason();
     return {
       documentId,
@@ -734,9 +740,31 @@ export function installWorld(binding, documentId) {
       )
     )
       return { status: "pending", reason: "本页必填校验未完成，请补齐后继续" };
+    if (packet.action === "next") {
+      pendingNext = { generation: packet.generation, documentId };
+      const link = el.closest("a[href]");
+      if (link && new URL(link.href).origin === location.origin) {
+        send("next-destination", { url: link.href });
+        pendingNext = null;
+      }
+    }
     el.click();
     return { status: "done" };
   };
+  const onNavigate = (event) => {
+    if (!pendingNext || !event.isTrusted) return;
+    if (event.userInitiated || !["push", "replace"].includes(event.navigationType)) {
+      pendingNext = null;
+      return;
+    }
+    if (pendingNext.generation === view.generation &&
+        pendingNext.documentId === documentId && ["running", "waiting"].includes(view.status) &&
+        new URL(event.destination.url).origin === location.origin) {
+      send("next-destination", { url: event.destination.url });
+      pendingNext = null;
+    }
+  };
+  globalThis.navigation?.addEventListener("navigate", onNavigate);
   globalThis.__superOffer = {
     documentId,
     inspect,
@@ -748,6 +776,7 @@ export function installWorld(binding, documentId) {
           !["running", "waiting"].includes(next.status)) {
         writes.clear();
         validationResults.clear();
+        pendingNext = null;
       }
       view = next;
       if (pendingProfile &&
@@ -765,6 +794,22 @@ export function installWorld(binding, documentId) {
       const results = [...validationResults.values()];
       validationResults.clear();
       return results;
+    },
+    formAnchor() {
+      const previous = new URL(mountedUrl), current = new URL(location.href);
+      if (previous.origin !== current.origin || previous.pathname !== current.pathname || previous.search !== current.search)
+        return false;
+      const inOriginalForm = (hash) => {
+        let name;
+        try { name = decodeURIComponent(hash.slice(1)); } catch { return false; }
+        if (!name || /^[\/!]/.test(name) || /[?=]/.test(name)) return false;
+        const targets = [...document.querySelectorAll("[id],[name]")]
+          .filter((el) => el.id === name || el.getAttribute("name") === name);
+        return targets.length === 1 && [...forms].some((form) => form.isConnected && (form === targets[0] || form.contains(targets[0])));
+      };
+      if ((previous.hash && !inOriginalForm(previous.hash)) || !inOriginalForm(current.hash)) return false;
+      mountedUrl = location.href;
+      return true;
     },
     controlPoint(command) {
       const element = command === "profile" ? profile
@@ -861,6 +906,8 @@ export function installWorld(binding, documentId) {
       validationObserver.disconnect();
       writes.clear();
       validationResults.clear();
+      pendingNext = null;
+      globalThis.navigation?.removeEventListener("navigate", onNavigate);
       document.removeEventListener("click", onUserClick, true);
       document.removeEventListener("input", onInput, true);
       document.removeEventListener("change", onInput, true);

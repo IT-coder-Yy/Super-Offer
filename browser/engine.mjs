@@ -16,6 +16,34 @@ const displayText = (text = "", limit = 12000) => {
   const shown = text.length > limit ? text.slice(0, limit - suffix.length).toWellFormed() + suffix : text;
   return shown.toWellFormed().replaceAll("\0", "␀");
 };
+const jobRoute = /^(?:jobs?|positions?|job[-_]?info|(?:job|position)[-_]?details?)$/i;
+function jobReferences(address) {
+  const url = new URL(address), references = {};
+  const add = (kind, value) => {
+    if (value?.trim()) (references[kind] ??= []).push(value.trim());
+  };
+  const fragment = url.hash.slice(1).replace(/^!/, "");
+  const routes = [url];
+  if (fragment.startsWith("/")) routes.push(new URL(url.origin + "/" + fragment.replace(/^\/+/, "")));
+  else if (fragment.startsWith("?") || fragment.includes("=")) routes.push(new URL(fragment.startsWith("?") ? fragment : "?" + fragment, url.origin));
+  for (const route of routes) {
+    const parts = route.pathname.split("/").filter(Boolean);
+    for (const [key, value] of route.searchParams) {
+      const name = key.replace(/[-_]/g, "").toLowerCase();
+      if (/^(?:job|position)(?:id|code)$/.test(name)) {
+        add(name.endsWith("code") ? "code" : "id", value);
+        add(name, value);
+      } else if (name === "id" && jobRoute.test(parts.at(-1))) add("id", value);
+    }
+    for (let i = 1; i < parts.length; i++) {
+      if (!jobRoute.test(parts[i - 1]) || jobRoute.test(parts[i])) continue;
+      // 跳过列表、申请入口和表单步骤名称。
+      if (/^(?:index|list|search|apply|applications?|details?|forms?|edit|resume|review|steps?(?:[-_]?\d+)?|next|login)$/i.test(parts[i])) continue;
+      try { add("id", decodeURIComponent(parts[i])); } catch { /* 非法编码不能确认岗位。 */ }
+    }
+  }
+  return references;
+}
 const publicUrl = (raw) => {
   try {
     const u = new URL(raw);
@@ -206,6 +234,7 @@ export class BrowserConnection {
     this.status = "ready";
     this.message = "已连接；填写停在最终提交前";
     this.allowedPages = new Set([page.url()]);
+    this.jobReferences = jobReferences(page.url());
     const session = await page.context().newCDPSession(page);
     if (selection !== this.selection) {
       await session.detach();
@@ -220,7 +249,7 @@ export class BrowserConnection {
       if (
         event.name !== binding ||
         event.executionContextId !== this.context ||
-        event.payload.length > 2000
+        event.payload.length > 10000
       )
         return;
       let data;
@@ -231,12 +260,26 @@ export class BrowserConnection {
       }
       if (
         !data ||
+        (event.payload.length > 2000 && data.command !== "next-destination") ||
         data.documentId !== this.documentId ||
         data.generation !== this.generation
       )
         return;
       if (data.command === "user-navigation") {
         this.expectedNavigation = false;
+        return;
+      }
+      if (data.command === "next-destination") {
+        if (this.expectedNavigation?.generation === this.generation && typeof data.url === "string" &&
+            URL.canParse(data.url) && new URL(data.url).origin === this.origin) {
+          const next = jobReferences(data.url);
+          const sameJob = Object.entries(next).every(([key, values]) =>
+            !this.jobReferences[key] || values.every((value) => this.jobReferences[key].includes(value)));
+          if (sameJob) {
+            this.expectedNavigation.url = data.url;
+            this.expectedNavigation.job = { ...next, ...this.jobReferences };
+          } else this.expectedNavigation = false;
+        }
         return;
       }
       if (
@@ -271,11 +314,24 @@ export class BrowserConnection {
       executionContextName: worldName,
     });
     if (selection !== this.selection) throw stopped();
-    this.navigation = (frame) => {
-      if (frame !== page.mainFrame() || page !== this.page) return;
-      const continueFlow = this.expectedNavigation === this.generation;
-      if (continueFlow && !this.runStopped && new URL(page.url()).origin === this.origin)
-        this.allowedPages.add(page.url());
+    const { frameTree } = await session.send("Page.getFrameTree");
+    const frameId = frameTree.frame.id;
+    const navigation = async (url, sameDocument) => {
+      if (session !== this.session || page !== this.page) return;
+      const before = this.generation;
+      const continueFlow = this.expectedNavigation?.generation === before && this.expectedNavigation.url === url;
+      if (sameDocument && !continueFlow && this.context) {
+        const anchor = await this.evaluate("formAnchor").catch(() => false);
+        if (before !== this.generation || session !== this.session || page.url() !== url) return;
+        if (anchor) {
+          this.allowedPages.add(url);
+          return;
+        }
+      }
+      if (continueFlow && !this.runStopped) {
+        this.allowedPages.add(url);
+        this.jobReferences = this.expectedNavigation.job;
+      }
       this.expectedNavigation = false;
       this.profileSelection = null;
       const generation = this.generation = randomUUID();
@@ -293,7 +349,13 @@ export class BrowserConnection {
         })
         .catch(() => this.changed());
     };
-    page.on("framenavigated", this.navigation);
+    // 导航与隔离世界的授权来自同一 CDP 会话，按浏览器发出的先后顺序匹配。
+    session.on("Page.navigatedWithinDocument", (e) => {
+      if (e.frameId === frameId) void navigation(e.url, true);
+    });
+    session.on("Page.frameNavigated", ({ frame }) => {
+      if (frame.id === frameId) void navigation(frame.url + (frame.urlFragment || ""), false);
+    });
     this.closeListener = () => {
       this.context = null;
       this.generation = randomUUID();
@@ -642,7 +704,7 @@ export class BrowserConnection {
       this.check(generation);
       await this.reconcile();
       this.check(generation);
-      this.expectedNavigation = generation;
+      this.expectedNavigation = { generation, url: null };
       const before = fields.map((x) => x.id).join(",");
       const next = await this.evaluate(
         "action",
@@ -657,10 +719,12 @@ export class BrowserConnection {
         this.automaticSteps++;
         await delay(200);
         if (generation === this.generation && this.context) {
-          this.expectedNavigation = false;
           const after = (await this.inspect()).map((x) => x.id).join(",");
           this.check(generation);
-          if (after !== before) return this.run(generation, mode);
+          if (after !== before) {
+            this.expectedNavigation = false;
+            return this.run(generation, mode);
+          }
           this.status = "waiting";
           this.message = "已触发下一步，请核对网站反馈后继续";
         }
@@ -916,7 +980,7 @@ export class BrowserConnection {
     this.status = "running";
     await this.changed();
     this.check(generation);
-    this.expectedNavigation = save ? false : generation;
+    this.expectedNavigation = save ? false : { generation, url: null };
     const runId = this.runId;
     let result;
     try {
@@ -926,10 +990,9 @@ export class BrowserConnection {
       if (runId === this.runId && generation !== this.generation) return this.state();
       throw error;
     }
-    if (!save && result.status === "done" && generation === this.generation) await delay(200);
     if (generation !== this.generation) return this.state();
     this.check(generation);
-    this.expectedNavigation = false;
+    if (result.status !== "done") this.expectedNavigation = false;
     if (!this.pauseForLogin(result)) {
       this.status = "waiting";
       this.message =
@@ -949,7 +1012,6 @@ export class BrowserConnection {
     this.expectedNavigation = false;
     clearInterval(this.heartbeat);
     this.heartbeat = null;
-    if (this.page && this.navigation) this.page.off("framenavigated", this.navigation);
     if (this.page && this.closeListener) this.page.off("close", this.closeListener);
     const disposing = this.context && this.evaluate("dispose").catch(() => {});
     const session = this.session;
