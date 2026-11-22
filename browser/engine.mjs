@@ -286,15 +286,8 @@ export class BrowserConnection {
         return;
       }
       if (data.command === "next-destination") {
-        if (this.expectedNavigation?.generation === this.generation && typeof data.url === "string" &&
-            URL.canParse(data.url) && new URL(data.url).origin === this.origin) {
-          const next = jobReferences(data.url);
-          const sameJob = Object.entries(next).every(([key, values]) =>
-            !this.jobReferences[key] || values.every((value) => this.jobReferences[key].includes(value)));
-          if (sameJob) {
-            this.expectedNavigation.url = data.url;
-            this.expectedNavigation.job = { ...next, ...this.jobReferences };
-          } else this.expectedNavigation = false;
+        if (this.expectedNavigation?.generation === this.generation) {
+          this.expectDestination(data.url);
         }
         return;
       }
@@ -332,6 +325,22 @@ export class BrowserConnection {
     if (selection !== this.selection) throw stopped();
     const { frameTree } = await session.send("Page.getFrameTree");
     const frameId = frameTree.frame.id;
+    session.on("Network.requestWillBeSent", ({ frameId: frame, type, requestId, loaderId, request, redirectResponse }) => {
+      const next = this.expectedNavigation;
+      if (session !== this.session || frame !== frameId || type !== "Document" || next?.generation !== this.generation || !next.url) return;
+      const address = new URL(next.url);
+      address.hash = "";
+      if (!redirectResponse) {
+        if (!next.request && request.url === address.href) next.request = { requestId, loaderId };
+        else this.expectedNavigation = false;
+        return;
+      }
+      // 只有已确认主文档请求的真实重定向，才能延长同岗下一步的授权。
+      if (next.request?.requestId !== requestId || next.request.loaderId !== loaderId || redirectResponse.url !== address.href ||
+          redirectResponse.status < 300 || redirectResponse.status >= 400) this.expectedNavigation = false;
+      else this.expectDestination(request.url + (request.urlFragment || ""));
+    });
+    await session.send("Network.enable");
     const navigation = async (url, sameDocument) => {
       if (session !== this.session || page !== this.page) return;
       const before = this.generation;
@@ -391,6 +400,18 @@ export class BrowserConnection {
         this.emit({ event: "ready" });
     }
     return this.state();
+  }
+  expectDestination(url) {
+    const next = this.expectedNavigation;
+    if (typeof url === "string" && URL.canParse(url) && new URL(url).origin === this.origin) {
+      const references = jobReferences(url), known = next.job || this.jobReferences;
+      if (Object.entries(references).every(([key, values]) => !known[key] || values.every((value) => known[key].includes(value)))) {
+        next.url = url;
+        next.job = { ...references, ...known };
+        return;
+      }
+    }
+    this.expectedNavigation = false;
   }
   async mount() {
     const page = this.page,

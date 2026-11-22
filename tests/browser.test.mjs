@@ -5,6 +5,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import { BrowserConnection } from "../browser/engine.mjs";
 import { inferMappings, readValue } from "../browser/mapping.mjs";
 import { fixture, profile } from "./browser-fixture.mjs";
@@ -142,12 +143,12 @@ after(async () => {
   await browser?.close();
   await server?.close();
 });
-async function setup(t, selected = profile(), route = "") {
+async function setup(t, selected = profile(), route = "", origin = server.url) {
   const context = await browser.newContext({
       viewport: { width: 1280, height: 900 },
     }),
     page = await context.newPage();
-  await page.goto(server.url + route);
+  await page.goto(origin + route);
   const events = [],
     connection = new BrowserConnection((e) => events.push(e));
   connection.attach(browser);
@@ -320,6 +321,78 @@ test("R19 手改无效必填项后马上下一步，旧页按这次回读的值�
   const actual = { atNext: await page.evaluate(() => JSON.parse(sessionStorage.getItem("atNext"))), status: row.status, recorded: row.actual, pending: connection.state().pending };
   t.diagnostic(JSON.stringify(actual));
   assert.deepEqual(actual, { atNext: { value: "123", marked: false }, status: "preserved", recorded: "123", pending: 0 });
+});
+
+test("R19 网站拦下下一步链接后本人打开同一地址仍撤权，真实链接跳转则继续", async (t) => {
+  const rows = [];
+  for (const cancel of [true, false]) {
+    const { page, connection } = await setup(t);
+    await page.locator("form").evaluate((form, cancel) => {
+      form.innerHTML = '<label>姓名<input></label><a role="button" href="/step2">下一步</a>';
+      if (cancel) form.querySelector("a").onclick = (event) => { event.preventDefault(); window.blocked = true; };
+    }, cancel);
+    await connection.fill("full", true);
+    await connection.job;
+    if (cancel) {
+      assert.ok(await page.evaluate(() => window.blocked));
+      await page.goto(server.url + "/step2");
+    }
+    await page.waitForURL("**/step2");
+    await until(() => connection.results.some((r) => r.label === "GitHub") || !connection.context && connection.message.includes("离开"), "核对下一步链接的实际导航");
+    rows.push({ cancel, overlay: await page.locator("#super-offer-controls").count(), field: await page.locator("#tail").inputValue(), submitted: await page.evaluate(() => window.submissions) });
+  }
+  t.diagnostic(JSON.stringify(rows));
+  assert.deepEqual(rows, [
+    { cancel: true, overlay: 0, field: "", submitted: 0 },
+    { cancel: false, overlay: 1, field: profile().data.basic.github, submitted: 0 },
+  ]);
+});
+
+test("R19 下一步仅跟随同岗顶层请求的重定向链，跨源跨岗及本人改道均撤权", async (t) => {
+  const openServer = async (respond) => {
+    const local = createServer(respond);
+    await new Promise((resolve) => local.listen(0, "127.0.0.1", resolve));
+    t.after(() => new Promise((resolve) => local.close(resolve)));
+    return "http://127.0.0.1:" + local.address().port;
+  };
+  let origin;
+  const foreign = await openServer((_req, res) => { res.writeHead(302, { Location: origin + "/end?jobId=A" }); res.end(); });
+  origin = await openServer((req, res) => {
+    const url = new URL(req.url, origin);
+    if (["/next", "/hop"].includes(url.pathname)) {
+      let destination = "/end?jobId=A";
+      if (url.pathname === "/next") {
+        const kind = url.searchParams.get("kind");
+        if (kind === "跨源") destination = foreign + "/return";
+        else if (kind === "终点换岗") destination = "/end?jobId=B";
+        else destination = "/hop?jobId=" + (kind === "中途换岗" ? "B" : "A");
+      }
+      res.writeHead(302, { Location: destination }); res.end(); return;
+    }
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    const form = url.pathname === "/end" ? '<label>GitHub<input id="tail"></label><button type="submit">最终提交申请</button>'
+      : '<label>姓名<input></label><button type="button">下一步</button><a id="manual">手动链接</a>';
+    res.end('<!doctype html><form onsubmit="window.submitted++;return false">' + form + '</form><script>window.submitted=0</script>');
+  });
+  const results = [];
+  for (const kind of ["同岗", "跨源", "中途换岗", "终点换岗", "人工"]) {
+    const { page, connection } = await setup(t, profile(), "/apply?jobId=A", origin);
+    await page.locator("form").evaluate((form, kind) => {
+      const next = "/next?jobId=A&kind=" + encodeURIComponent(kind);
+      form.querySelector("button").onclick = () => { if (kind !== "人工") location.href = next; };
+      form.querySelector("a").href = next;
+    }, kind);
+    await connection.fill("full", true);
+    await connection.job;
+    if (kind === "人工") await page.locator("#manual").click();
+    await page.waitForURL("**/end?jobId=*");
+    await until(() => connection.results.some((r) => r.label === "GitHub") || (!connection.context && connection.message.includes("离开")), "等候重定向后的挂载或撤权");
+    results.push({ kind, panel: await page.locator("#super-offer-controls").count(), field: await page.locator("#tail").inputValue(), submitted: await page.evaluate(() => window.submitted) });
+  }
+  t.diagnostic(JSON.stringify(results));
+  assert.deepEqual(results, ["同岗", "跨源", "中途换岗", "终点换岗", "人工"].map((kind) => ({
+    kind, panel: Number(kind === "同岗"), field: kind === "同岗" ? profile().data.basic.github : "", submitted: 0,
+  })));
 });
 
 test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人", async (t) => {

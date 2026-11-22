@@ -180,6 +180,8 @@ export function installWorld(binding, documentId) {
     );
   const onInput = (event) => {
     if (event.isTrusted && !writing && event.target !== host) {
+      pendingNext = null;
+      if (["running", "waiting"].includes(view.status)) send("user-navigation");
       touched.add(event.target);
       if (event.target.type === "radio")
         for (const el of radios(event.target)) touched.add(el);
@@ -785,11 +787,6 @@ export function installWorld(binding, documentId) {
       reviewWrites();
       reviewInvalidFields();
       pendingNext = { generation: packet.generation, documentId };
-      const link = el.closest("a[href]");
-      if (link && new URL(link.href).origin === location.origin) {
-        send("next-destination", { url: link.href });
-        pendingNext = null;
-      }
     }
     el.click();
     return { status: "done" };
