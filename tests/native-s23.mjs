@@ -239,6 +239,11 @@ try {
     await page.getByLabel("已保存场次", { exact: true }).selectOption(practiceId);
     await poll(async () => (await page.getByLabel("当前回答", { exact: true }).inputValue()) === saved.session.draft, "重启后草稿未回显");
     assert.equal((await view(practiceId)).session.turns[0].answer, null);
+    assert.equal((await view(practiceId)).session.pending, null);
+    const sent = page.locator("details").filter({ has: page.locator("summary").filter({ hasText: /^查看本[次场]实际发送内容$/ }) });
+    assert.equal(await sent.count(), 1, "已生成问题在重启后应能查看实际发送内容");
+    await sent.locator("summary").first().click();
+    assert.equal(await sent.locator("pre").textContent(), sentPrompts[0]);
   });
   await step("S3-06 / AC23：发送后服务失败，手动重试保留唯一回答和配置", async () => {
     failFollowUp = true;
@@ -290,6 +295,16 @@ try {
     assert.equal(finished.reports.at(-1).mainNumber, null);
     assert.equal(finished.session.turns[2].answer, null);
     assert.ok(sentPrompts.every((prompt) => !prompt.includes("只属于第3题的未发草稿")));
+    const history = page.locator("details").filter({ has: page.getByText("查看本场实际发送内容", { exact: true }) });
+    if (!await history.evaluate((el) => el.open)) await history.locator("summary").first().click();
+    const historySelect = history.getByLabel("本场模型请求", { exact: true });
+    const tasks = (await snapshot()).tasks.filter((task) => task.contextId === "interview:" + practiceId);
+    assert.deepEqual(await historySelect.locator("option").evaluateAll((opts) => opts.map((o) => o.value)), tasks.map((t) => t.id));
+    for (const task of [tasks[0], tasks.at(-1)]) {
+      await historySelect.selectOption(task.id);
+      assert.equal(await history.locator("pre").textContent(), task.input.text);
+      assert.ok(sentPrompts.includes(task.input.text));
+    }
     assert.ok(finished.session.turns.every((turn) => turn.followUp <= 2));
     await page.getByText("原始模型报告（未核实）", { exact: true }).first().click();
     await page.getByRole("button", { name: "围绕此项复练", exact: true }).first().click();

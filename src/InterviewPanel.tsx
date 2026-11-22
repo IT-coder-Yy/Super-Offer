@@ -58,6 +58,7 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
   const [contextConfirmation, setContextConfirmation] = useState(false);
   const [correction, setCorrection] = useState<CorrectionDraft | null>(null);
   const [endIntent, setEndIntent] = useState<"skip" | "dont_know" | "reveal" | null>(null);
+  const [sentTaskId, setSentTaskId] = useState("");
   const currentRef = useRef<SessionView | null>(null);
   const draftRef = useRef("");
   const busyRef = useRef(false);
@@ -290,7 +291,8 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
     catch (e) { notify(errorOf(e).message, true); }
   }
   const session = current?.session;
-  const task = workspace.state.tasks.find((t) => t.id === session?.pending?.taskId);
+  const sessionTasks = session ? workspace.state.tasks.filter((t) => t.contextId === "interview:" + session.id) : [];
+  const task = sessionTasks.find((t) => t.id === sentTaskId) ?? sessionTasks.at(-1);
   const active = session?.status === "generating";
   return <section className="workflow-panel" aria-label="文字面试">
     <div className="section-title"><div><h2>岗位与项目文字面试</h2><p className="muted">按真实回答追问，保留材料版本和评价依据。练习与模拟不会改变真实申请阶段。</p></div>
@@ -331,7 +333,13 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
         {session.status === "paused" && <button disabled={busy || saving} onClick={() => setContextConfirmation(true)}>核对当前配置与授权后继续</button>}
       </div>
       {session.partial && <details><summary>{active ? "查看正在接收的原始内容" : "查看保留的部分／未通过校验结果"}</summary><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{session.partial}</pre></details>}
-      {task && <details><summary>查看本次实际发送内容</summary><p className="muted">服务：{task.provider.name} / {task.provider.model}；引用固定于本次任务，不含API Key。</p><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{task.input.text}</pre></details>}
+      {task && <details><summary>查看本场实际发送内容</summary>
+        <Field label="本场模型请求"><select value={task.id} onChange={(e) => setSentTaskId(e.target.value)}>
+          {sessionTasks.map((item, i) => <option key={item.id} value={item.id}>第 {i + 1} 次 · {formatDate(item.startedAt)} · {item.versions.filter((v) => v.kind === "evidence").length} 段源码</option>)}
+        </select></Field>
+        <p className="muted">{task.provider.name} / {task.provider.model}</p>
+        <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{task.input.text}</pre>
+      </details>}
       {current.reports.map((report) => <article key={report.id} className="settings-section">
         <h3>{report.mainNumber === null ? "本场报告" : "第 " + report.mainNumber + " 题反馈"}</h3>
         <p className="muted">原文对照：已核对回答引文、材料版本与源码原文；模型解释未作语义核实。</p>
