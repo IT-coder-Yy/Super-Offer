@@ -1,7 +1,7 @@
 use crate::{
     backup,
     domain::*,
-    model::Runtime,
+    model::{Runtime, SaveProvider},
     retrieval,
     source::{Evidence, SourceCommand, SourceHost, SourceVersion},
     store::{Store, digest, encode, get, list, put},
@@ -14,7 +14,7 @@ use std::{
     fs,
     io::{Cursor, Read, Write},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 fn change(store: &mut Store, value: Value) -> Value {
@@ -891,6 +891,172 @@ fn pr2_case_distinct_zip_paths_are_kept_as_archive_paths() {
     assert_eq!(digest(&fs::read(&path).unwrap()), original_hash);
 }
 
+#[derive(Default)]
+struct Pr2Vault(Mutex<BTreeMap<String, String>>);
+impl Vault for Pr2Vault {
+    fn get(&self, slot: &str) -> Result<Option<String>> {
+        Ok(self.0.lock().unwrap().get(slot).cloned())
+    }
+    fn set(&self, slot: &str, value: &str) -> Result<()> {
+        self.0.lock().unwrap().insert(slot.into(), value.into());
+        Ok(())
+    }
+    fn delete(&self, slot: &str) -> Result<()> {
+        self.0.lock().unwrap().remove(slot);
+        Ok(())
+    }
+}
+
+#[test]
+fn pr2_local_upgrade_keeps_credentials_but_external_restore_does_not() {
+    let root = tempfile::tempdir().unwrap();
+    let vault = Arc::new(Pr2Vault::default());
+    let runtime = Runtime::new(
+        Store::open(root.path()).unwrap(),
+        vault.clone(),
+        Arc::new(|_| {}),
+    );
+    let dataset = runtime.lock().unwrap().dataset_id.clone();
+    let config = runtime
+        .save_provider(
+            &dataset,
+            SaveProvider {
+                purpose: Purpose::Chat,
+                name: "本机合成配置".into(),
+                endpoint: "https://example.invalid/v1".into(),
+                model: "synthetic".into(),
+                expected_version: None,
+                key: Some("synthetic-pr2-key-only".into()),
+                remove_key: false,
+            },
+        )
+        .unwrap();
+    assert!(runtime.provider_status().unwrap()[0].has_key);
+    let old_slot = Runtime::slot(&runtime.lock().unwrap(), &config);
+    drop(runtime);
+    let old_dir = root.path().join("datasets").join(&dataset);
+    let conn = Connection::open(old_dir.join("data.sqlite")).unwrap();
+    conn.execute_batch("DROP TABLE interview_reports; DROP TABLE interview_sessions; DROP TABLE evidence; DROP TABLE source_files; DROP TABLE source_versions; DROP TABLE fill_runs; PRAGMA user_version=1; VACUUM;").unwrap();
+    drop(conn);
+    let original_hashes = dataset_hashes(&old_dir);
+    let runtime = Runtime::new(
+        Store::open(root.path()).unwrap(),
+        vault.clone(),
+        Arc::new(|_| {}),
+    );
+    assert_ne!(runtime.lock().unwrap().dataset_id, dataset);
+    assert_eq!(dataset_hashes(&old_dir), original_hashes);
+    let has_key = runtime.provider_status().unwrap()[0].has_key;
+    eprintln!("PR2 credential: after real Store::open v1-to-v2 upgrade has_key={has_key}");
+    assert!(has_key, "同机升级后应仍能使用原系统凭证命名空间");
+    assert_eq!(Runtime::slot(&runtime.lock().unwrap(), &config), old_slot);
+    let v1_backup = fs::read_dir(root.path().join("backups"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let v1_backup_hash = digest(&fs::read(&v1_backup).unwrap());
+    drop(runtime);
+    let runtime = Runtime::new(
+        Store::open(root.path()).unwrap(),
+        vault.clone(),
+        Arc::new(|_| {}),
+    );
+    assert!(
+        runtime.provider_status().unwrap()[0].has_key,
+        "重启后仍保留同机凭证"
+    );
+    let receipt = backup::export(&runtime.lock().unwrap(), true, true).unwrap();
+    assert!(
+        receipt
+            .manifest
+            .files
+            .iter()
+            .all(|file| file.path != crate::store::CREDENTIAL_NAMESPACE_FILE)
+    );
+    let mut portable = zip::ZipArchive::new(fs::File::open(&receipt.path).unwrap()).unwrap();
+    assert!(
+        portable
+            .by_name(crate::store::CREDENTIAL_NAMESPACE_FILE)
+            .is_err()
+    );
+    {
+        let mut store = runtime.lock().unwrap();
+        let prepared = backup::prepare_path(&store, Path::new(&receipt.path)).unwrap();
+        // Even a staged, unlisted local sidecar must not be copied during an external restore.
+        fs::write(
+            prepared
+                .staged
+                .path()
+                .join(crate::store::CREDENTIAL_NAMESPACE_FILE),
+            &dataset,
+        )
+        .unwrap();
+        let token = prepared.preview.token.clone();
+        backup::commit(&mut store, prepared, &token, true, false).unwrap();
+        assert_ne!(Runtime::slot(&store, &config), old_slot);
+    }
+    assert!(
+        !runtime.provider_status().unwrap()[0].has_key,
+        "同机导入外部备份也不能复用旧凭证"
+    );
+    assert_eq!(
+        vault.0.lock().unwrap().len(),
+        1,
+        "迁移及恢复不复制或删除凭证"
+    );
+    {
+        let mut store = runtime.lock().unwrap();
+        let prepared = backup::prepare_path(&store, &v1_backup).unwrap();
+        assert_eq!(prepared.preview.manifest.schema_version, 1);
+        let token = prepared.preview.token.clone();
+        backup::commit(&mut store, prepared, &token, true, false).unwrap();
+    }
+    assert!(
+        !runtime.provider_status().unwrap()[0].has_key,
+        "外部旧版备份恢复不能等同于同机升级"
+    );
+    assert_eq!(digest(&fs::read(&v1_backup).unwrap()), v1_backup_hash);
+    drop(runtime);
+    let runtime = Runtime::new(
+        Store::open(root.path()).unwrap(),
+        vault.clone(),
+        Arc::new(|_| {}),
+    );
+    assert!(
+        !runtime.provider_status().unwrap()[0].has_key,
+        "外部恢复重启后也不沿用旧凭证"
+    );
+
+    let mut injected = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..portable.len() {
+        let mut entry = portable.by_index(index).unwrap();
+        injected
+            .start_file(
+                entry.name().unwrap(),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        std::io::copy(&mut entry, &mut injected).unwrap();
+    }
+    injected
+        .start_file(
+            crate::store::CREDENTIAL_NAMESPACE_FILE,
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    injected.write_all(dataset.as_bytes()).unwrap();
+    let injection = injected.finish().unwrap().into_inner();
+    let store = runtime.lock().unwrap();
+    let active = fs::read(root.path().join("active")).unwrap();
+    assert!(
+        backup::prepare(&store, &injection).is_err(),
+        "外部备份不能夹带本地凭证命名空间"
+    );
+    assert_eq!(fs::read(root.path().join("active")).unwrap(), active);
+}
+
 #[test]
 fn pr2_submodule_coverage_checks_real_path_boundaries_without_executing_or_fetching() {
     for directory in [true, false] {
@@ -1076,4 +1242,23 @@ fn pr2_portable_backup_rejects_identical_duplicate_entries() {
     );
     assert_eq!(fs::read(root.path().join("active")).unwrap(), active);
     assert_eq!(dataset_hashes(&store.dir()), before);
+}
+
+#[test]
+fn pr2_invalid_local_credential_namespace_does_not_rewrite_data() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    add_profile(&mut store, "损坏本地关联测试");
+    let dir = store.dir();
+    let active = fs::read(root.path().join("active")).unwrap();
+    drop(store);
+    let before = dataset_hashes(&dir);
+    fs::write(
+        dir.join(crate::store::CREDENTIAL_NAMESPACE_FILE),
+        b"not-a-valid-namespace",
+    )
+    .unwrap();
+    assert_eq!(Store::open(root.path()).err().unwrap().code, "DATA_CORRUPT");
+    assert_eq!(fs::read(root.path().join("active")).unwrap(), active);
+    assert_eq!(dataset_hashes(&dir), before);
 }

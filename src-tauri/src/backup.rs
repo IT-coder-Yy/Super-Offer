@@ -660,20 +660,22 @@ pub fn commit(
         ));
     }
     let previous_backup = export(store, true, true)?;
-    activate(store, prepared, previous_backup)
+    activate(store, prepared, previous_backup, None)
 }
 pub(crate) fn upgrade(store: &mut Store) -> Result<()> {
     // 先验证并备份旧库，迁移只发生在新数据集，原active和旧文件始终保留。
     validate_database(&store.dir().join("data.sqlite"))?;
     let previous_backup = export(store, true, true)?;
     let prepared = prepare_path(store, Path::new(&previous_backup.path))?;
-    activate(store, prepared, previous_backup)?;
+    let credential_namespace = store.credential_namespace.clone();
+    activate(store, prepared, previous_backup, Some(credential_namespace))?;
     Ok(())
 }
 fn activate(
     store: &mut Store,
     prepared: Prepared,
     previous_backup: BackupReceipt,
+    local_credential_namespace: Option<String>,
 ) -> Result<RestoreReceipt> {
     let dataset_id = id();
     let target = store.root.join("datasets").join(&dataset_id);
@@ -706,9 +708,15 @@ fn activate(
     bump(&tx)?;
     tx.commit()?;
     validate_database(&target.join("data.sqlite"))?;
+    let credential_namespace = local_credential_namespace.unwrap_or_else(|| dataset_id.clone());
+    atomic_write(
+        &target.join(crate::store::CREDENTIAL_NAMESPACE_FILE),
+        credential_namespace.as_bytes(),
+    )?;
     atomic_write(&store.root.join("active"), dataset_id.as_bytes())?;
     store.conn = connection;
     store.dataset_id = dataset_id.clone();
+    store.credential_namespace = credential_namespace;
     Ok(RestoreReceipt {
         dataset_id,
         previous_backup,

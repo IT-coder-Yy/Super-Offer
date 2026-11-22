@@ -13,9 +13,11 @@ use std::{
 pub struct Store {
     pub root: PathBuf,
     pub dataset_id: String,
+    pub(crate) credential_namespace: String,
     pub conn: Connection,
     _lock: fs::File,
 }
+pub(crate) const CREDENTIAL_NAMESPACE_FILE: &str = "credential-namespace";
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -157,6 +159,15 @@ impl Store {
             ));
         }
         fs::create_dir_all(dir.join("assets"))?;
+        // Only local upgrades inherit this sidecar; it is never part of a portable backup.
+        let credential_namespace = match fs::read_to_string(dir.join(CREDENTIAL_NAMESPACE_FILE)) {
+            Ok(value) => value.trim().to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => dataset_id.clone(),
+            Err(error) => return Err(error.into()),
+        };
+        uuid::Uuid::parse_str(&credential_namespace).map_err(|_| {
+            AppError::new("DATA_CORRUPT", "本地凭证关联损坏，请保留数据目录后恢复。")
+        })?;
         let conn = connect(&dir.join("data.sqlite"))?;
         if !pointer.exists() {
             atomic_write(&pointer, dataset_id.as_bytes())?;
@@ -164,6 +175,7 @@ impl Store {
         let mut store = Self {
             root,
             dataset_id,
+            credential_namespace,
             conn,
             _lock: lock,
         };

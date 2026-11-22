@@ -73,10 +73,10 @@ impl Runtime {
             .map_err(|_| AppError::new("WRITE_FAILED", "数据状态异常，请先退出并重新打开应用。"))
     }
     pub fn slot(store: &Store, provider: &ProviderConfig) -> String {
-        // 数据集标识在恢复时重建，恢复的非秘密配置不会复用旧凭证。
+        // 同机升级保留本地命名空间；外部恢复另建，不能复用原凭证。
         format!(
             "{}:{}:{}",
-            store.dataset_id,
+            store.credential_namespace,
             provider.purpose.key(),
             provider.version
         )
