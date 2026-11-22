@@ -1353,6 +1353,59 @@ async fn practice_followups_stop_at_two_and_answer_replay_is_idempotent() {
 }
 
 #[tokio::test]
+async fn revealing_a_practice_question_does_not_carry_its_draft_to_the_next_question() {
+    let mut teaching = report();
+    teaching["points"] = json!([{"category":"material_gap","basis":"knowledge","answerQuote":"",
+        "observation":"本题没有提交回答。","action":"阅读解析。","evidenceIds":[]}]);
+    let server = Server::new(vec![
+        Reply::Content(json!({"question":"第一题？","evidenceIds":[]})),
+        Reply::Content(teaching),
+        Reply::Content(json!({"question":"第二题？","evidenceIds":[]})),
+    ]);
+    let (_root, runtime, dataset) = fixture();
+    configure(&runtime, &dataset, &server.endpoint);
+    let host = InterviewHost::new();
+    let created = create_session(&host, &runtime, &dataset, "practice", 2);
+    let session_id = created["session"]["id"].as_str().unwrap();
+    advance(&host, &runtime, &dataset, &created);
+    let first = settled(&host, &runtime, &dataset, session_id).await;
+    let private_draft = "只属于第一题的未发草稿";
+    let saved = command(
+        &host,
+        &runtime,
+        &dataset,
+        json!({
+            "kind":"save_draft", "sessionId":session_id, "expectedRevision":first["session"]["revision"],
+            "operationId":id(), "text":private_draft
+        }),
+    )
+    .unwrap();
+    assert_eq!(saved["session"]["draft"], private_draft);
+    command(
+        &host,
+        &runtime,
+        &dataset,
+        json!({"kind":"reveal","sessionId":session_id,"expectedRevision":saved["session"]["revision"]}),
+    )
+    .unwrap();
+    let feedback = settled(&host, &runtime, &dataset, session_id).await;
+    assert_eq!(feedback["reports"].as_array().unwrap().len(), 1);
+    advance(&host, &runtime, &dataset, &feedback);
+    let second = settled(&host, &runtime, &dataset, session_id).await;
+    assert_eq!(second["session"]["turns"][1]["question"], "第二题？");
+    assert!(second["session"]["turns"][0]["answer"].is_null());
+    assert!(
+        server
+            .inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| !s.contains(private_draft))
+    );
+    assert_eq!(second["session"]["draft"], "");
+}
+
+#[tokio::test]
 async fn unsubmitted_answers_allow_teaching_but_cannot_be_graded_as_omissions() {
     for action in ["skip", "dont_know", "reveal", "finish"] {
         let mut feedback = report();

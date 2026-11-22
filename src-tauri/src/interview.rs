@@ -1430,6 +1430,9 @@ fn apply_result(conn: &Connection, session: &mut InterviewSession, task: &ModelT
             if number > session.question_count {
                 return Err(AppError::invalid("主问题数量已完成。"));
             }
+            if number > 1 {
+                session.draft.clear();
+            }
             session.turns.push(Turn {
                 id: id(),
                 main_number: number,

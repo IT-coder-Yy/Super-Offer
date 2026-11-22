@@ -12,6 +12,7 @@ const root = resolve(".s0-work", `s23-native-${new Date().toISOString().replaceA
 const executable = resolve(process.env.SUPER_OFFER_TEST_EXE || ".s0-work/tauri-target/debug/super-offer.exe");
 await mkdir(root, { recursive: true });
 const results = [], errors = [], requests = [];
+const sentPrompts = [];
 const resumeApproved = "受控简历核准使用的片段";
 const resumePrivate = "受控简历只供本地预览的段落";
 let browser, page, child, service, datasetId, applicationId, practiceId, repracticeId, simulationId;
@@ -120,7 +121,9 @@ async function newSession(mode) {
 }
 async function startQuestion(sessionId, number) {
   await click(number === 1 ? "开始本场" : "继续本场");
-  return waitView(sessionId, (v) => v.session.status === "waiting_answer" && v.session.turns.at(-1).mainNumber === number, `第 ${number} 题未出现`);
+  const view = await waitView(sessionId, (v) => v.session.status === "waiting_answer" && v.session.turns.at(-1).mainNumber === number, `第 ${number} 题未出现`);
+  await page.getByRole("heading", { name: `第 ${number} 题`, exact: true }).waitFor();
+  return view;
 }
 function reportFor(input) {
   const answer = input.turns.find((turn) => turn.answer?.text)?.answer.text;
@@ -153,6 +156,7 @@ async function startService() {
       assert.equal(body.stream, true);
       const prompt = body.messages.map((message) => message.content).find((text) => text.includes("\n资料："));
       const input = JSON.parse(prompt.split("\n资料：").at(-1));
+      sentPrompts.push(prompt);
       requests.push({ step: input.step, mode: input.mode, mainQuestionCount: input.mainQuestionCount,
         turnCount: input.turns.length, answerIds: input.turns.filter((turn) => turn.answer).map((turn) => turn.answer.id),
         approvedResumePresent: prompt.includes(resumeApproved), privateResumePresent: prompt.includes(resumePrivate) });
@@ -259,7 +263,18 @@ try {
     for (let number = 2; number <= 6; number++) {
       await startQuestion(practiceId, number);
       blameNextSkip = number === 2;
-      await click("跳过本题");
+      if (number === 4) assert.equal(await page.getByLabel("当前回答", { exact: true }).inputValue(), "");
+      if (number === 3) {
+        const input = page.getByLabel("当前回答", { exact: true });
+        await input.fill("只属于第3题的未发草稿");
+        await click("查看解析并结束本题");
+        await click("返回编辑");
+        assert.equal(await input.inputValue(), "只属于第3题的未发草稿");
+        await click("查看解析并结束本题");
+        await click("确认查看解析");
+      } else {
+        await click("跳过本题");
+      }
       if (number === 2) {
         const failed = await waitView(practiceId, (v) => v.session.error?.code === "EVIDENCE_INVALID", "跳过的题被算作作答遗漏");
         assert.equal(failed.reports.length, 1);
@@ -273,6 +288,8 @@ try {
     assert.deepEqual(finished.session.turns.map((turn) => turn.mainNumber), [1, 2, 3, 4, 5, 6]);
     assert.equal(finished.reports.length, 7);
     assert.equal(finished.reports.at(-1).mainNumber, null);
+    assert.equal(finished.session.turns[2].answer, null);
+    assert.ok(sentPrompts.every((prompt) => !prompt.includes("只属于第3题的未发草稿")));
     assert.ok(finished.session.turns.every((turn) => turn.followUp <= 2));
     await page.getByText("原始模型报告（未核实）", { exact: true }).first().click();
     await page.getByRole("button", { name: "围绕此项复练", exact: true }).first().click();

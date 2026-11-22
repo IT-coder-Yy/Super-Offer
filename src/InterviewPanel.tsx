@@ -57,7 +57,7 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
   const [finish, setFinish] = useState(false);
   const [contextConfirmation, setContextConfirmation] = useState(false);
   const [correction, setCorrection] = useState<CorrectionDraft | null>(null);
-  const [skipIntent, setSkipIntent] = useState<"skip" | "dont_know" | null>(null);
+  const [endIntent, setEndIntent] = useState<"skip" | "dont_know" | "reveal" | null>(null);
   const currentRef = useRef<SessionView | null>(null);
   const draftRef = useRef("");
   const busyRef = useRef(false);
@@ -204,7 +204,7 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
     const operationId = previous && previous.sessionId === s.id && previous.turnId === turn.id &&
       previous.text === value && previous.disposition === disposition ? previous.operationId : crypto.randomUUID();
     lastAnswer.current = { sessionId: s.id, turnId: turn.id, text: value, disposition, operationId };
-    setSkipIntent(null);
+    setEndIntent(null);
     await run("answer", { text: value, disposition, operationId });
   }
   async function openCreation(report?: InterviewReport, focus = "") {
@@ -319,9 +319,9 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
       <div className="actions">
         {session.status === "waiting_answer" && <>
           <button className="primary" disabled={busy || saving || !draft.trim()} onClick={() => void answer("answer")}>发送回答</button>
-          <button disabled={busy || saving} onClick={() => draft.trim() ? setSkipIntent("dont_know") : void answer("dont_know")}>我不会，结束本题</button>
-          <button disabled={busy || saving} onClick={() => draft.trim() ? setSkipIntent("skip") : void answer("skip")}>跳过本题</button>
-          {session.mode === "practice" && <button disabled={busy || saving} onClick={() => void run("reveal")}>查看解析并结束本题</button>}
+          <button disabled={busy || saving} onClick={() => draft.trim() ? setEndIntent("dont_know") : void answer("dont_know")}>我不会，结束本题</button>
+          <button disabled={busy || saving} onClick={() => draft.trim() ? setEndIntent("skip") : void answer("skip")}>跳过本题</button>
+          {session.mode === "practice" && <button disabled={busy || saving} onClick={() => draft.trim() ? setEndIntent("reveal") : void run("reveal")}>查看解析并结束本题</button>}
         </>}
         {!active && session.status !== "waiting_answer" && session.status !== "completed" &&
           <button className="primary" disabled={busy || saving} onClick={() => void run("advance")}>{session.error ? "手动重试／继续" : !session.turns.length ? "开始本场" : session.pending?.kind === "feedback" ? "生成本题反馈" : "继续本场"}</button>}
@@ -431,8 +431,11 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
     {finish && <Dialog title="结束本场并生成报告" onCancel={() => setFinish(false)} actions={<><button onClick={() => setFinish(false)}>取消</button><button className="primary" onClick={() => { setFinish(false); void run("finish"); }}>确认结束</button></>}>
       <p>将按已完成的问题和实际回答生成报告。尚未发送的输入留在本地，不会假装成已回答；真实申请阶段保持原样。</p>
     </Dialog>}
-    {skipIntent && <Dialog title="结束当前问题" onCancel={() => setSkipIntent(null)} actions={<><button onClick={() => setSkipIntent(null)}>返回编辑</button><button onClick={() => void answer(skipIntent)}>{skipIntent === "skip" ? "确认跳过" : "确认不会"}</button></>}>
-      <p>当前未发送的输入不会作为回答外发，结束本题后会清空输入框。</p>
+    {endIntent && <Dialog title="结束当前问题" onCancel={() => setEndIntent(null)} actions={<><button onClick={() => setEndIntent(null)}>返回编辑</button><button onClick={() => {
+      if (endIntent === "reveal") { setEndIntent(null); void run("reveal"); }
+      else void answer(endIntent);
+    }}>{endIntent === "reveal" ? "确认查看解析" : endIntent === "skip" ? "确认跳过" : "确认不会"}</button></>}>
+      <p>本题草稿不会作为回答发送。{endIntent === "reveal" ? "进入下一题时会清空输入框。" : "结束本题后会清空输入框。"}</p>
     </Dialog>}
     {contextConfirmation && <Dialog title="确认继续使用的模型与范围" onCancel={() => setContextConfirmation(false)} actions={<><button onClick={() => setContextConfirmation(false)}>取消</button><button className="primary" onClick={() => { setContextConfirmation(false); void run("confirm_context", { confirmed: true }); }}>确认更新并保留回答</button></>}>
       <p>使用当前聊天配置：{workspace.state.providers.find((p) => p.purpose === "chat")?.name} / {workspace.state.providers.find((p) => p.purpose === "chat")?.model}，以及所选固定材料版本的当前已确认外发范围。</p>
