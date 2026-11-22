@@ -640,6 +640,8 @@ export function installWorld(binding, documentId) {
         rememberInvalid(el);
         return fail("页面校验未通过，保留原有内容，请本人修正");
       }
+      if (!touched.has(el) && previous && (packet.value == null || packet.value === ""))
+        return fail("换档缺值，保留旧内容，请人工核对");
       clearPending(el);
       return { ...result, status: "preserved", reason: touched.has(el) ? "用户手动修改优先" : "补空保留非空内容" };
     }

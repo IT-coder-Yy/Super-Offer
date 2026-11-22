@@ -729,6 +729,26 @@ test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人"
       assert.deepEqual(actual, { back, sameDocument: true, owned: true, name: "乙", status: "updated" });
     }
   });
+  test("R19 DOM 换档缺项后补空保留旧值、红标和待办，明确手改仍优先", async (t) => {
+    const selected = minimal("甲");
+    const { page, connection } = await setup(t, selected);
+    await page.locator("form").evaluate((form) => { form.innerHTML = '<label>手机<input id="phone"></label><label>姓名<input id="name"></label>'; });
+    await fill(connection);
+    const next = minimal("乙"); delete next.data.basic.phone;
+    await connection.switchProfile(next, []);
+    await fill(connection);
+    const oldReason = await page.locator("#phone").getAttribute("data-super-offer-pending");
+    await page.locator("#name").fill("本人修正");
+    await fill(connection, "blank");
+    const row = result(connection, "手机"), actual = { phone: await page.locator("#phone").inputValue(), reason: await page.locator("#phone").getAttribute("data-super-offer-pending"), status: row.status, recorded: row.actual, name: await page.locator("#name").inputValue() };
+    t.diagnostic(JSON.stringify(actual));
+    assert.match(oldReason, /换档缺值/);
+    assert.deepEqual(actual, { phone: selected.data.basic.phone, reason: oldReason, status: "pending", recorded: selected.data.basic.phone, name: "本人修正" });
+    await page.locator("#phone").fill("13900000001");
+    await fill(connection, "blank");
+    assert.equal(await page.locator("#phone").inputValue(), "13900000001");
+    assert.equal(result(connection, "手机").status, "preserved");
+  });
   test("R19 DOM 下一步前回读手工修正的必填项并清除已解决待办", async (t) => {
     const { page, connection } = await setup(t, minimal());
     await page.locator("form").evaluate((form) => {
