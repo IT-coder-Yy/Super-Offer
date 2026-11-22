@@ -579,13 +579,11 @@ export class BrowserConnection {
       }
       const content = readValue(this.profile.data, field.path);
       if (!field.path) {
-        this.record({
-          fieldId: field.id,
-          label: field.label,
-          status: field.value ? "preserved" : "pending",
-          reason: field.reason,
-          actual: field.value,
-        });
+        const result = await this.evaluate("mark", this.packet({ fieldId: field.id, reason: field.reason }));
+        this.check(generation);
+        if (result.status === "stale") throw stopped();
+        if (this.pauseForLogin(result)) return;
+        this.record({ fieldId: field.id, label: field.label, ...result });
         await this.changed();
         continue;
       }
@@ -596,8 +594,6 @@ export class BrowserConnection {
       this.check(generation);
       if (result.status === "stale") throw stopped();
       if (this.pauseForLogin(result)) return;
-      await delay(30);
-      this.check(generation);
       const readback = await this.evaluate("fieldState", field.id);
       this.check(generation);
       if (

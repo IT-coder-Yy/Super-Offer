@@ -387,8 +387,9 @@ export function installWorld(binding, documentId) {
     autocomplete: el.autocomplete || "",
     owned: owned.has(el),
     touched: touched.has(el),
-    valid: (!el.validity || el.validity.valid) && (!required(el) || !!String(value(el)).trim()),
+    valid: validValue(el) && (!required(el) || !!String(value(el)).trim()),
   });
+  const validValue = (el) => (!el.validity || el.validity.valid) && el.getAttribute("aria-invalid") !== "true";
   const loginReason = () => {
     const inputs = [...document.querySelectorAll("input")].filter(visible);
     if (inputs.some((el) => el.type === "password"))
@@ -465,11 +466,17 @@ export function installWorld(binding, documentId) {
       el.setAttribute("data-super-offer-pending", reason);
     }
   };
+  const clearPending = (el) => {
+    if (el.hasAttribute("data-super-offer-pending")) {
+      el.style.outline = "";
+      el.removeAttribute("data-super-offer-pending");
+    }
+  };
   const safe = (packet) =>
     location.href === mountedUrl && packet.documentId === documentId &&
     packet.generation === view.generation &&
     view.status === "running";
-  const write = (packet) => {
+  const write = async (packet) => {
     const el = elements.get(packet.fieldId);
     const result = {
       fieldId: packet.fieldId,
@@ -517,37 +524,13 @@ export function installWorld(binding, documentId) {
     )
       return fail("此控件需要人工选择或附件操作");
     let wanted = String(packet.value);
-    if (el.type === "radio") {
-      const option = radios(el).find(
+    if (el.type === "radio" || el.tagName === "SELECT") {
+      const radio = el.type === "radio";
+      const option = (radio ? radios(el) : [...el.options]).find(
         (x) =>
           !x.disabled &&
           (normalize(x.value) === normalize(wanted) ||
-            normalize(label(x)) === normalize(wanted)),
-      );
-      if (!option) return fail("找不到对应选项");
-      writing = true;
-      try {
-        option.click();
-      } finally {
-        writing = false;
-      }
-      const actual = String(value(el));
-      if (actual !== option.value || !option.checked)
-        return fail("单选项回读失败");
-      owned.set(el, { value: actual });
-      return {
-        ...result,
-        actual,
-        status: current ? "updated" : "filled",
-        reason: "已回读单选项；未确认服务端保存",
-      };
-    }
-    if (el.tagName === "SELECT") {
-      const option = [...el.options].find(
-        (x) =>
-          !x.disabled &&
-          (normalize(x.value) === normalize(wanted) ||
-            normalize(x.label) === normalize(wanted)),
+            normalize(radio ? label(x) : x.label) === normalize(wanted)),
       );
       if (!option) return fail("找不到对应选项");
       wanted = option.value;
@@ -564,27 +547,46 @@ export function installWorld(binding, documentId) {
           : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
     if (!setter) return fail("控件没有可用写入入口");
-    writing = true;
+    const writeValue = (v) => {
+      writing = true;
+      try {
+        if (el.type === "radio") {
+          const group = radios(el);
+          const choice = group.find((x) => x.value === v);
+          if (choice) { choice.click(); return; }
+          const checked = group.find((x) => x.checked);
+          if (checked) checked.checked = false;
+        } else setter.call(el, v);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } finally {
+        writing = false;
+      }
+    };
+    let reason = "";
     try {
       el.scrollIntoView({ block: "center", behavior: "instant" });
-      setter.call(el, wanted);
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    } catch {
-      return fail("页面拒绝写入");
-    } finally {
-      writing = false;
-    }
+      writeValue(wanted);
+    } catch { reason = "页面拒绝写入"; }
+    if (String(value(el)) === wanted && validValue(el))
+      await new Promise((resolve) => setTimeout(resolve, 30));
     const actual = String(value(el));
-    if (
-      actual !== wanted ||
-      (el.validity && !el.validity.valid) ||
-      el.getAttribute("aria-invalid") === "true"
-    )
-      return { ...fail("写后回读或页面校验未通过"), actual };
+    if (!safe(packet)) return { ...result, status: "stale", actual, reason: "任务或页面已变化" };
+    if (!el.isConnected || touched.has(el)) return { ...result, status: "verify", actual, reason: "字段已变化或用户已编辑，请核对实际内容" };
+    if (reason || actual !== wanted || !validValue(el)) {
+      if (actual !== current) {
+        try { writeValue(current); } catch { /* 按下方实际回读报告。 */ }
+      }
+      const restored = String(value(el));
+      if (!reason) reason = "写后回读或页面校验未通过";
+      if (restored !== current) {
+        owned.delete(el);
+        reason += "，网站未恢复原值，请本人核对";
+      }
+      return { ...fail(reason), actual: restored };
+    }
     owned.set(el, { value: actual });
-    el.style.outline = "";
-    el.removeAttribute("data-super-offer-pending");
+    clearPending(el);
     return {
       ...result,
       actual,
@@ -680,8 +682,19 @@ export function installWorld(binding, documentId) {
       const el = elements.get(id);
       return el?.isConnected ? field(el) : null;
     },
-    mark(id, reason) {
-      pending(elements.get(id), reason);
+    mark(packet) {
+      if (!safe(packet)) return { status: "stale", actual: "", reason: "任务或页面已变化" };
+      const login = loginReason();
+      if (login) return { status: "pending", actual: "", needsLogin: true, reason: login };
+      const el = elements.get(packet.fieldId);
+      if (!el?.isConnected) return { status: "pending", actual: "", reason: "字段已消失或不可访问" };
+      const actual = String(value(el));
+      if (actual.trim()) {
+        clearPending(el);
+        return { status: "preserved", actual, reason: packet.reason };
+      }
+      pending(el, packet.reason);
+      return { status: "pending", actual, reason: packet.reason };
     },
     uploadTarget(packet) {
       const el = elements.get(packet.fieldId);

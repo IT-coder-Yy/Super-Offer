@@ -196,6 +196,21 @@ test("PR2 停止后按钮、草稿、草稿保存和继续均不能重新写，�
   assert.equal(await page.locator("#name").inputValue(), "合成甲");
 });
 
+test("PR2 换档校验失败恢复原内容并回读，同页后项继续", async (t) => {
+  const { page, connection } = await setup(t);
+  await fill(connection);
+  const first = await page.locator("#email").inputValue();
+  const next = profile("合成乙");
+  next.data.basic.email = "不合法邮箱";
+  next.data.basic.github = "https://example.invalid/new";
+  await connection.switchProfile(next, [{ id: next.id, name: next.name }]);
+  const { results } = await fill(connection);
+  const result = results.find((r) => r.label === "邮箱");
+  const actual = { first, after: await page.locator("#email").inputValue(), report: result.actual, status: result.status, valid: await page.locator("#email").evaluate((el) => el.validity.valid), tail: await page.locator("#tail").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { first: "fixture@example.invalid", after: first, report: first, status: "pending", valid: true, tail: next.data.basic.github });
+});
+
 test("PR2 同标签切换到另一岗位的片段路由后必须重选", async (t) => {
   const { page, connection } = await setup(t, profile(), "/#/applications/job-a");
   const previous = connection.generation;
@@ -234,6 +249,46 @@ test("PR2 已确认的下一步允许同岗片段跨步，未跳转的按钮不�
   const actual = { stepError, sameJob, kept, otherJob: await page.locator("#name").inputValue(), panels: await page.locator("#super-offer-controls").count(), submitted: await page.evaluate(() => window.submissions) };
   t.diagnostic(JSON.stringify(actual));
   assert.deepEqual(actual, { stepError: null, sameJob: profile().data.basic.github, kept: "本人输入", otherJob: "", panels: 0, submitted: 0 });
+});
+
+test("PR2 网页稍后拒绝换档值时恢复合法旧值，首次不合法的空字段保持空白", async (t) => {
+  const firstProfile = profile();
+  firstProfile.data.basic.email = "无效";
+  const { page, connection } = await setup(t, firstProfile);
+  await fill(connection);
+  const initiallyEmpty = await page.locator("#email").inputValue();
+  const firstDocument = connection.documentId;
+  await page.reload();
+  await until(() => connection.context && firstDocument !== connection.documentId, "重新打开同一表单");
+  const valid = profile("已确认档案");
+  await connection.switchProfile(valid, []);
+  await fill(connection);
+  const next = profile("换档");
+  next.data.basic.email = "later@example.invalid";
+  await page.locator("#email").evaluate((el) => el.addEventListener("input", () => {
+    if (el.value.startsWith("later")) setTimeout(() => el.setAttribute("aria-invalid", "true"), 5);
+    else el.removeAttribute("aria-invalid");
+  }));
+  await connection.switchProfile(next, []);
+  const { results } = await fill(connection);
+  const report = results.find((item) => item.documentId === connection.documentId && item.label === "邮箱");
+  const actual = { initiallyEmpty, after: await page.locator("#email").inputValue(), status: report.status, reported: report.actual, marked: !!await page.locator("#email").getAttribute("data-super-offer-pending") };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { initiallyEmpty: "", after: valid.data.basic.email, status: "pending", reported: valid.data.basic.email, marked: true });
+});
+
+test("PR2 无匹配的空字段网页标红并列待办，有值字段和后续可填项保留", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("#answer").evaluate((el) => el.parentElement.insertAdjacentHTML("afterend", '<label>补充情况<textarea id="has-value">网页原有内容</textarea></label>'));
+  const result = await fill(connection, "blank");
+  const pending = result.results.find((r) => r.label === "为何选择此岗位");
+  const actual = { status: pending.status, mark: !!await page.locator("#answer").getAttribute("data-super-offer-pending"), outline: await page.locator("#answer").evaluate((el) => getComputedStyle(el).outlineColor), preserved: await page.locator("#has-value").inputValue(), preservedMark: await page.locator("#has-value").getAttribute("data-super-offer-pending"), tail: await page.locator("#tail").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { status: "pending", mark: true, outline: "rgb(198, 40, 40)", preserved: "网页原有内容", preservedMark: null, tail: profile().data.basic.github });
+  await page.locator("#answer").fill("本人已补齐");
+  const again = await fill(connection, "blank");
+  assert.equal(again.results.find((r) => r.fieldId === pending.fieldId).status, "preserved");
+  assert.equal(await page.locator("#answer").getAttribute("data-super-offer-pending"), null);
 });
 
 test("PR2 刷新重用字段编号或站点就地改题时拒绝旧草稿，重新检查后可写", async (t) => {
