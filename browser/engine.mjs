@@ -988,13 +988,15 @@ export class BrowserConnection {
   }
   async advance(save) {
     this.assertActive();
-    if (this.status === "waiting") {
-      const prior = this.generation;
-      await this.reconcile();
-      if (prior !== this.generation) throw stopped();
-    }
-    const generation = this.generation = randomUUID();
+    if (this.status === "running") throw new Error("正在处理当前步骤，请稍后重试。");
+    let generation = this.generation;
+    const wasWaiting = this.status === "waiting";
     this.status = "running";
+    if (wasWaiting) {
+      await this.reconcile();
+      this.check(generation);
+    }
+    if (!wasWaiting || save) generation = this.generation = randomUUID();
     await this.changed();
     this.check(generation);
     this.expectedNavigation = save ? false : { generation, url: null };

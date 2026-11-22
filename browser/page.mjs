@@ -8,6 +8,7 @@ export function installWorld(binding, documentId) {
     touched = new WeakSet(),
     writes = new Map(),
     validationResults = new Map(),
+    invalidFields = new Map(),
     uploadStates = new WeakMap(),
     forms = new Set(document.forms);
   let sequence = 0,
@@ -510,6 +511,7 @@ export function installWorld(binding, documentId) {
     }
   };
   const clearPending = (el) => {
+    invalidFields.delete(el);
     if (el.hasAttribute("data-super-offer-pending")) {
       el.style.outline = "";
       el.removeAttribute("data-super-offer-pending");
@@ -533,6 +535,24 @@ export function installWorld(binding, documentId) {
     pending(el, reason);
     return { status: "stale-field", label: field(el).label, actual: String(value(el)), reason };
   };
+  const rememberInvalid = (el, requiresEdit = false) =>
+    invalidFields.set(el, { expected: identity(el), requiresEdit });
+  const reviewInvalidFields = () => {
+    if (location.href !== mountedUrl || !view.connected || Date.now() - lastTick > 6000 ||
+        !["running", "waiting"].includes(view.status) || loginReason()) return;
+    for (const [el, check] of invalidFields) {
+      if (!el.isConnected || !visible(el) || !matchesExpected(el, check.expected)) {
+        invalidFields.delete(el);
+        continue;
+      }
+      if (el.disabled || el.readOnly || !validValue(el) ||
+          (required(el) && !String(value(el)).trim()) || (check.requiresEdit && !touched.has(el))) continue;
+      invalidFields.delete(el);
+      clearPending(el);
+      validationResults.set(key(el), { fieldId: key(el), label: field(el).label,
+        actual: String(value(el)), status: "preserved", reason: "已回读校验通过的现有内容" });
+    }
+  };
   const reviewWrites = () => {
     if (writes.size && loginReason()) { writes.clear(); return; }
     for (const [el, attempt] of writes) {
@@ -544,7 +564,11 @@ export function installWorld(binding, documentId) {
       let actual = String(value(el)), reason = "", status = "verify";
       if (!el.isConnected || !visible(el) || el.disabled || el.readOnly || !matchesExpected(el, attempt.expected))
         reason = "写入后字段已变化，保留现场，请重新检查";
-      else if (touched.has(el)) reason = "用户已编辑，保留手改内容";
+      else if (touched.has(el)) {
+        reason = "用户已编辑，保留手改内容";
+        if (validValue(el) && (!required(el) || actual.trim())) status = "preserved";
+        else rememberInvalid(el);
+      }
       else if (actual !== attempt.value || choiceOf(el) !== attempt.choice)
         reason = "页面随后改变了内容，保留现场，请核对";
       else if (!validValue(el)) {
@@ -557,10 +581,12 @@ export function installWorld(binding, documentId) {
         else owned.delete(el);
         reason = restored ? "页面随后校验未通过，已恢复写入前内容，请核对" : "页面随后校验未通过，网站未恢复原值，请本人核对";
         status = "pending";
+        rememberInvalid(el, true);
       }
       if (reason) {
         writes.delete(el);
-        pending(el, reason);
+        if (status === "preserved") clearPending(el);
+        else pending(el, reason);
         validationResults.set(key(el), { fieldId: key(el), label: field(el).label, actual, status, reason });
       }
     }
@@ -591,7 +617,10 @@ export function installWorld(binding, documentId) {
     if (!matchesExpected(el, packet.expected)) return { ...result, ...staleField(el) };
     const current = String(value(el)), previous = owned.get(el), beforeChoice = choiceOf(el);
     if (current.trim() && (packet.mode === "blank" || touched.has(el))) {
-      if (!validValue(el)) return fail("页面校验未通过，保留原有内容，请本人修正");
+      if (!validValue(el)) {
+        rememberInvalid(el);
+        return fail("页面校验未通过，保留原有内容，请本人修正");
+      }
       clearPending(el);
       return { ...result, status: "preserved", reason: touched.has(el) ? "用户手动修改优先" : "补空保留非空内容" };
     }
@@ -753,6 +782,8 @@ export function installWorld(binding, documentId) {
     )
       return { status: "pending", reason: "本页必填校验未完成，请补齐后继续" };
     if (packet.action === "next") {
+      reviewWrites();
+      reviewInvalidFields();
       pendingNext = { generation: packet.generation, documentId };
       const link = el.closest("a[href]");
       if (link && new URL(link.href).origin === location.origin) {
@@ -790,6 +821,7 @@ export function installWorld(binding, documentId) {
         validationResults.clear();
         pendingNext = null;
       }
+      if (!next.connected || !["running", "waiting"].includes(next.status)) invalidFields.clear();
       view = next;
       if (pendingProfile &&
           next.profileSelection?.requestId === pendingProfile.requestId &&
@@ -803,6 +835,7 @@ export function installWorld(binding, documentId) {
       if (packet.documentId !== documentId || packet.generation !== view.generation ||
           !["running", "waiting"].includes(view.status)) return [];
       reviewWrites();
+      reviewInvalidFields();
       const results = [...validationResults.values()];
       validationResults.clear();
       return results;
@@ -847,6 +880,7 @@ export function installWorld(binding, documentId) {
       if (!validValue(el)) {
         const reason = "页面校验未通过，保留原有内容，请本人修正";
         pending(el, reason);
+        rememberInvalid(el);
         return { status: "pending", actual, reason };
       }
       if (actual.trim()) {
@@ -922,6 +956,7 @@ export function installWorld(binding, documentId) {
       validationObserver.disconnect();
       writes.clear();
       validationResults.clear();
+      invalidFields.clear();
       pendingNext = null;
       globalThis.navigation?.removeEventListener("navigate", onNavigate);
       document.removeEventListener("click", onUserClick, true);

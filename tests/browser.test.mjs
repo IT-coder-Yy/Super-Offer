@@ -273,6 +273,55 @@ test("R19 新一轮填写尚未更新到网页时断开也会撤掉上一代浮�
   assert.deepEqual(actual, { status: "disconnected", interrupted: "STALE_TASK", overlay: 0, name: "" });
 });
 
+test("R19 手动下一步触发网站迟到校验时，网页和清单保留已恢复的原值", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>邮箱<input type="email" required></label><button type="button">下一步</button>';
+    const email = form.querySelector("input");
+    email.oninput = () => { if (!email.value.startsWith("later")) email.setCustomValidity(""); };
+    form.querySelector("button").onclick = () => setTimeout(() => {
+      email.setCustomValidity("当前邮箱不可用"); window.rejected = true;
+    }, 125);
+  });
+  await fill(connection);
+  const original = await page.locator("input").inputValue(), next = profile("合成乙");
+  next.data.basic.email = "later@example.invalid";
+  await connection.switchProfile(next, []);
+  await fill(connection);
+  await connection.dispatch({ kind: "advance", runId: connection.runId });
+  await page.waitForFunction(() => window.rejected);
+  await until(() => connection.results.some((r) => r.status === "pending"), "等待网页校验进入清单").catch(() => {});
+  const row = connection.results.find((r) => r.label === "邮箱");
+  const actual = { ...await page.locator("input").evaluate((el) => ({ webpage: el.value, valid: el.validity.valid, marked: el.hasAttribute("data-super-offer-pending") })),
+    recorded: row.actual, status: row.status, pending: connection.state().pending };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { webpage: original, valid: true, marked: true, recorded: original, status: "pending", pending: 1 });
+});
+
+test("R19 手改无效必填项后马上下一步，旧页按这次回读的值归档", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>现场编号<input required pattern="[0-9]+" value="abc"></label><button type="button">下一步</button>';
+    form.querySelector("button").onclick = () => {
+      const input = form.querySelector("input");
+      sessionStorage.setItem("atNext", JSON.stringify({ value: input.value, marked: input.hasAttribute("data-super-offer-pending") }));
+      location.href = "/step2";
+    };
+  });
+  const original = connection.documentId;
+  await fill(connection);
+  assert.equal(connection.state().pending, 1);
+  await connection.advance(false);
+  assert.equal(page.url(), server.url + "/");
+  await page.locator("form input").fill("123");
+  await connection.advance(false);
+  await page.waitForURL("**/step2");
+  const row = connection.results.find((r) => r.documentId === original && r.label === "现场编号");
+  const actual = { atNext: await page.evaluate(() => JSON.parse(sessionStorage.getItem("atNext"))), status: row.status, recorded: row.actual, pending: connection.state().pending };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { atNext: { value: "123", marked: false }, status: "preserved", recorded: "123", pending: 0 });
+});
+
 test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人", async (t) => {
   const { page, connection } = await setup(t);
   await page.locator("form").evaluate((form) => {
@@ -361,6 +410,20 @@ test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人"
       t.diagnostic(JSON.stringify(actual));
       assert.deepEqual(actual, { refusal, index: 1, status: "pending", value: "男" });
     }
+  });
+  test("R19 DOM 下一步前回读手工修正的必填项并清除已解决待办", async (t) => {
+    const { page, connection } = await setup(t, minimal());
+    await page.locator("form").evaluate((form) => {
+      form.innerHTML = '<label>未知字段<input id="custom" required pattern="[0-9]+" value="abc"></label><button type="button" id="next">下一步</button>';
+      window.nextClicks = 0; form.querySelector("button").onclick = () => window.nextClicks++;
+    });
+    await fill(connection, "blank");
+    assert.equal(result(connection, "未知字段").status, "pending");
+    await page.locator("#custom").fill("123");
+    await connection.advance(false);
+    const row = result(connection, "未知字段"), actual = { value: await page.locator("#custom").inputValue(), actual: row.actual, status: row.status, marked: await page.locator("#custom").getAttribute("data-super-offer-pending"), nextClicks: await page.evaluate(() => window.nextClicks) };
+    t.diagnostic(JSON.stringify(actual));
+    assert.deepEqual(actual, { value: "123", actual: "123", status: "preserved", marked: null, nextClicks: 1 });
   });
 }
 
