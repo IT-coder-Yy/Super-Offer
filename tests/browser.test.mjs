@@ -171,6 +171,28 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("R18 DOM 迟到139ms校验恢复合法旧邮箱，其他字段继续且结果更新", async (t) => {
+  const { page, connection } = await setup(t);
+  await fill(connection);
+  const old = await page.locator("#email").inputValue();
+  await page.locator("#email").evaluate((el) => el.addEventListener("input", () => {
+    if (el.value.startsWith("later")) {
+      window.startedAt = performance.now();
+      setTimeout(() => { window.rejectedAt = performance.now(); el.setAttribute("aria-invalid", "true"); }, 139);
+    } else el.removeAttribute("aria-invalid");
+  }));
+  const next = profile("切换档案");
+  next.data.basic.email = "later@example.invalid";
+  next.data.basic.github = "https://example.invalid/next";
+  await connection.switchProfile(next, []);
+  await fill(connection);
+  const result = connection.results.find((item) => item.label === "邮箱");
+  const actual = { old, after: await page.locator("#email").inputValue(), tail: await page.locator("#tail").inputValue(), status: result.status, reported: result.actual,
+    marked: !!await page.locator("#email").getAttribute("data-super-offer-pending"), delay: await page.evaluate(() => window.rejectedAt - window.startedAt) };
+  t.diagnostic(JSON.stringify(actual));
+  assert.ok(actual.delay >= 130);
+  assert.deepEqual({ ...actual, delay: undefined }, { old, after: old, tail: next.data.basic.github, status: "pending", reported: old, marked: true, delay: undefined });
+});
 test("R18 DOM 无value及同值单选精确点击匹配项并核对真实checked节点", async (t) => {
   const results = [];
   for (const sameValue of [false, true]) {
@@ -186,6 +208,68 @@ test("R18 DOM 无value及同值单选精确点击匹配项并核对真实checked
   }
   t.diagnostic(JSON.stringify(results));
   assert.deepEqual(results, [{ sameValue: false, checked: "female", status: "filled" }, { sameValue: true, checked: "female", status: "filled" }]);
+});
+test("R18 DOM 非空无效必填项列待办且不覆盖，修正后解除标记", async (t) => {
+  const selected = profile(); selected.data.education = [];
+  const { page, connection } = await setup(t, selected);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>邮箱<input id="email" type="email" required value="invalid"></label><label>补充说明<textarea id="custom" required aria-invalid="true">网站原有内容</textarea></label><label>姓名<input id="name"></label><button type="submit">最终提交申请</button>';
+  });
+  await fill(connection, "blank");
+  const snapshot = async () => ({
+    fields: await page.locator("#email,#custom").evaluateAll((elements) => elements.map((el) => ({ value: el.value, marked: el.hasAttribute("data-super-offer-pending") }))),
+    statuses: connection.results.filter((item) => ["邮箱", "补充说明"].includes(item.label)).map((item) => item.status),
+    name: await page.locator("#name").inputValue(), submissions: await page.evaluate(() => window.submissions),
+  });
+  const before = await snapshot();
+  t.diagnostic(JSON.stringify(before));
+  assert.deepEqual(before, { fields: [{ value: "invalid", marked: true }, { value: "网站原有内容", marked: true }], statuses: ["pending", "pending"], name: selected.data.basic.name, submissions: 0 });
+  await page.locator("#email").fill("manual@example.invalid");
+  await page.locator("#custom").evaluate((el) => el.removeAttribute("aria-invalid"));
+  await fill(connection, "blank");
+  assert.deepEqual(await snapshot(), { fields: [{ value: "manual@example.invalid", marked: false }, { value: "网站原有内容", marked: false }], statuses: ["preserved", "preserved"], name: selected.data.basic.name, submissions: 0 });
+});
+test("R18 DOM 完成后原生延迟校验仍恢复旧值，不依赖一次固定等待", async (t) => {
+  const selected = profile(); selected.data.education = [];
+  const { page, connection } = await setup(t, selected);
+  await page.locator("form").evaluate((form) => { form.innerHTML = '<label>邮箱<input id="email" type="email"></label><button type="submit">最终提交申请</button>'; });
+  await fill(connection);
+  const next = profile("后续档案"); next.data.education = []; next.data.basic.email = "later@example.invalid";
+  await page.locator("#email").evaluate((el) => el.addEventListener("input", () => {if(!el.value.startsWith("later"))el.setCustomValidity("");}));
+  await connection.switchProfile(next, []);
+  await fill(connection);
+  assert.equal(await page.locator("#email").inputValue(), next.data.basic.email);
+  await page.locator("#email").evaluate((el) => el.setCustomValidity("站点稍后拒绝"));
+  await until(() => connection.results.some((item) => item.label === "邮箱" && item.status === "pending"), "等待既有心跳复核原生校验");
+  assert.equal(await page.locator("#email").inputValue(), selected.data.basic.email);
+  assert.equal(connection.results.find((item) => item.label === "邮箱").actual, selected.data.basic.email);
+});
+test("R18 DOM 迟到校验不能覆盖用户手改、停止或换档后的现场", async (t) => {
+  for (const change of ["manual", "stop", "profile", "navigation", "readonly", "login"]) {
+    const selected = profile(); selected.data.education = [];
+    const { page, connection } = await setup(t, selected);
+    await page.locator("form").evaluate((form) => { form.innerHTML = '<label>邮箱<input id="email" type="email"></label><button type="submit">最终提交申请</button>'; });
+    await fill(connection);
+    const next = profile("待校验档案"); next.data.education = []; next.data.basic.email = "later@example.invalid";
+    await connection.switchProfile(next, []);
+    await fill(connection);
+    if (change === "manual") await page.locator("#email").fill("manual@example.invalid");
+    if (change === "stop") await connection.control("stop");
+    if (change === "profile") await connection.switchProfile(profile("再次换档"), []);
+    if (change === "readonly") await page.locator("#email").evaluate((el) => { el.readOnly = true; });
+    if (change === "login") await page.locator("form").evaluate((form) => form.insertAdjacentHTML("beforeend", '<label>验证码<input></label><button type="button">登录</button>'));
+    if (change === "navigation") {
+      const generation = connection.generation;
+      await page.evaluate(() => {location.hash="/another-application";});
+      await until(() => connection.generation !== generation && !connection.context, "等待旧授权页面撤下");
+    }
+    const expected = change === "manual" ? "manual@example.invalid" : next.data.basic.email;
+    await page.locator("#email").evaluate((el) => { window.postValidationInputs = 0; el.addEventListener("input",()=>window.postValidationInputs++); el.setAttribute("aria-invalid", "true"); });
+    await connection.changed();
+    assert.equal(await page.locator("#email").inputValue(), expected, change);
+    assert.equal(await page.evaluate(()=>window.postValidationInputs), 0, change);
+    if (change === "stop") assert.equal(connection.status, "stopped");
+  }
 });
 test("R18 DOM 同值单选手改优先，歧义值和网站改选不得假报成功", async (t) => {
   const selected = profile(); selected.data.education = [];

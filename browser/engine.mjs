@@ -72,7 +72,9 @@ export class BrowserConnection {
       ).length,
     };
   }
-  async changed() {
+  async changed(fieldFinished = false) {
+    // 填写中只在该项已记入清单后消费校验结果；并发心跳不能抢先清掉它。
+    if (fieldFinished || this.status === "waiting") await this.reconcile();
     const state = this.state();
     const view = {
       connected: state.connected,
@@ -468,6 +470,16 @@ export class BrowserConnection {
     else this.results[index] = result;
     if (this.results.length > 5000) this.results = this.results.slice(-5000);
   }
+  async reconcile() {
+    if (!this.context || this.runStopped || !["running", "waiting"].includes(this.status)) return;
+    const generation = this.generation;
+    const results = await this.evaluate("reconcile", this.packet()).catch(() => []);
+    if (generation !== this.generation) return;
+    for (const result of results) {
+      const original = this.results.find((r) => r.documentId === this.documentId && r.fieldId === result.fieldId);
+      if (original) this.record({ ...original, ...result, path: result.label === original.label ? original.path : null });
+    }
+  }
   async fill(mode = "full", autoAdvance = this.autoAdvance, automatic = false) {
     this.assertActive();
     if (this.profileSelection?.status === "pending")
@@ -581,7 +593,7 @@ export class BrowserConnection {
       if (field.type === "file") {
         await this.upload(field.id, false, generation, field.uploadState);
         if (this.status === "paused") return;
-        await this.changed();
+        await this.changed(true);
         continue;
       }
       const content = readValue(this.profile.data, field.path);
@@ -591,7 +603,7 @@ export class BrowserConnection {
         if (result.status === "stale") throw stopped();
         if (this.pauseForLogin(result)) return;
         this.record({ fieldId: field.id, label: field.label, ...result, status: result.status === "stale-field" ? "pending" : result.status });
-        await this.changed();
+        await this.changed(true);
         continue;
       }
       const result = await this.evaluate(
@@ -603,7 +615,7 @@ export class BrowserConnection {
       if (this.pauseForLogin(result)) return;
       if (result.status === "stale-field") {
         this.record({ fieldId: field.id, ...result, status: "pending" });
-        await this.changed();
+        await this.changed(true);
         continue;
       }
       const readback = await this.evaluate("fieldState", field.id);
@@ -620,13 +632,15 @@ export class BrowserConnection {
         result.actual = readback?.value ?? "";
       }
       this.record({ ...result, path: field.path });
-      await this.changed();
+      await this.changed(true);
     }
     if (
       this.autoAdvance &&
       !document.embeddedFrames &&
       this.automaticSteps < 50
     ) {
+      this.check(generation);
+      await this.reconcile();
       this.check(generation);
       this.expectedNavigation = generation;
       const before = fields.map((x) => x.id).join(",");
@@ -893,6 +907,11 @@ export class BrowserConnection {
   }
   async advance(save) {
     this.assertActive();
+    if (this.status === "waiting") {
+      const prior = this.generation;
+      await this.reconcile();
+      if (prior !== this.generation) throw stopped();
+    }
     const generation = this.generation = randomUUID();
     this.status = "running";
     await this.changed();

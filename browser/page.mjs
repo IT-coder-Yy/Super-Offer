@@ -6,6 +6,8 @@ export function installWorld(binding, documentId) {
     ids = new WeakMap(),
     owned = new WeakMap(),
     touched = new WeakSet(),
+    writes = new Map(),
+    validationResults = new Map(),
     uploadStates = new WeakMap();
   let sequence = 0,
     view = { generation: "", status: "ready", profileName: "", profiles: [] },
@@ -497,17 +499,60 @@ export function installWorld(binding, documentId) {
   const safe = (packet) =>
     location.href === mountedUrl && packet.documentId === documentId &&
     packet.generation === view.generation &&
-    view.status === "running";
+    view.status === "running" && view.connected && Date.now() - lastTick <= 6000;
   const matchesExpected = (el, expected) => {
     const current = field(el);
     return !expected || Object.entries(expected).every(([key, value]) =>
       JSON.stringify(current[key]) === JSON.stringify(value));
+  };
+  const identity = (el) => {
+    const { id, label, section, type, entryId, entryIndex, autocomplete, options } = field(el);
+    return { id, label, section, type, entryId, entryIndex, autocomplete, options };
   };
   const staleField = (el) => {
     const reason = "当前字段或选项已变化，请重新检查";
     pending(el, reason);
     return { status: "stale-field", label: field(el).label, actual: String(value(el)), reason };
   };
+  const reviewWrites = () => {
+    if (writes.size && loginReason()) { writes.clear(); return; }
+    for (const [el, attempt] of writes) {
+      if (location.href !== mountedUrl || attempt.generation !== view.generation ||
+          !view.connected || Date.now() - lastTick > 6000 || !["running", "waiting"].includes(view.status)) {
+        writes.delete(el);
+        continue;
+      }
+      let actual = String(value(el)), reason = "", status = "verify";
+      if (!el.isConnected || !visible(el) || el.disabled || el.readOnly || !matchesExpected(el, attempt.expected))
+        reason = "写入后字段已变化，保留现场，请重新检查";
+      else if (touched.has(el)) reason = "用户已编辑，保留手改内容";
+      else if (actual !== attempt.value ||
+          (el.type === "radio" && radios(el).find((x) => x.checked) !== attempt.choice))
+        reason = "页面随后改变了内容，保留现场，请核对";
+      else if (!validValue(el)) {
+        // 仅撤回仍能确认属于本代次、原控件且未被手改的这次写入。
+        writes.delete(el);
+        try { attempt.restore(); } catch { /* 以下回读报告恢复是否完成。 */ }
+        actual = String(value(el));
+        const restored = actual === attempt.before &&
+          (el.type !== "radio" || radios(el).find((x) => x.checked) === attempt.beforeChoice);
+        if (restored && attempt.previous) owned.set(el, attempt.previous);
+        else owned.delete(el);
+        reason = restored ? "页面随后校验未通过，已恢复写入前内容，请核对" : "页面随后校验未通过，网站未恢复原值，请本人核对";
+        status = "pending";
+      }
+      if (reason) {
+        writes.delete(el);
+        pending(el, reason);
+        validationResults.set(key(el), { fieldId: key(el), label: field(el).label, actual, status, reason });
+      }
+    }
+  };
+  const validationObserver = new MutationObserver(reviewWrites);
+  validationObserver.observe(document.documentElement, {
+    attributes: true, childList: true, subtree: true,
+    attributeFilter: ["aria-invalid", "disabled", "readonly", "type", "name", "required", "pattern", "value"],
+  });
   const write = async (packet) => {
     const el = elements.get(packet.fieldId);
     const result = {
@@ -526,8 +571,13 @@ export function installWorld(binding, documentId) {
     const login = loginReason();
     if (login) return { ...result, reason: login, needsLogin: true };
     if (!el?.isConnected || !visible(el)) return fail("字段已消失或不可访问");
-    if (!matchesExpected(el, packet.expected)) {
-      return { ...result, ...staleField(el) };
+    if (!matchesExpected(el, packet.expected)) return { ...result, ...staleField(el) };
+    const current = String(value(el)), previous = owned.get(el),
+      beforeChoice = el.type === "radio" ? radios(el).find((x) => x.checked) : undefined;
+    if (current.trim() && (packet.mode === "blank" || touched.has(el))) {
+      if (!validValue(el)) return fail("页面校验未通过，保留原有内容，请本人修正");
+      clearPending(el);
+      return { ...result, status: "preserved", reason: touched.has(el) ? "用户手动修改优先" : "补空保留非空内容" };
     }
     if (touched.has(el)) return fail("用户手动修改优先");
     if (unsupportedControl(el)) return fail("自定义选项或复合控件请本人操作，不向内部输入框写入资料");
@@ -538,14 +588,10 @@ export function installWorld(binding, documentId) {
       )
     )
       return fail("此项须本人在网站处理，工具不代填");
-    const current = String(value(el)), previous = owned.get(el),
-      beforeChoice = el.type === "radio" ? radios(el).find((x) => x.checked) : undefined;
     if (packet.value == null || packet.value === "")
       return current && previous
         ? fail("换档缺值，保留旧内容，请人工核对")
         : fail("档案缺少此项");
-    if (packet.mode === "blank" && current.trim())
-      return { ...result, status: "preserved", reason: "补空保留非空内容" };
     if (current && (!previous || previous.value !== current ||
         (el.type === "radio" && previous.choice !== beforeChoice)))
       return fail("原有内容或来源无法确认，已保留");
@@ -621,6 +667,9 @@ export function installWorld(binding, documentId) {
       return { ...fail(reason), actual: restored };
     }
     owned.set(el, { value: actual, ...(el.type === "radio" && { choice }) });
+    writes.set(el, { generation: packet.generation, value: actual, choice,
+      before: current, beforeChoice, previous, expected: identity(el),
+      restore: () => writeValue(current, beforeChoice) });
     clearPending(el);
     return {
       ...result,
@@ -681,7 +730,7 @@ export function installWorld(binding, documentId) {
       packet.action === "next" &&
       [...document.querySelectorAll("input,textarea,select")].some(
           (x) => visible(x) && required(x) &&
-            (!String(value(x)).trim() || (x.validity && !x.validity.valid)),
+            (!String(value(x)).trim() || !validValue(x)),
       )
     )
       return { status: "pending", reason: "本页必填校验未完成，请补齐后继续" };
@@ -695,6 +744,11 @@ export function installWorld(binding, documentId) {
     action,
     update(next) {
       lastTick = Date.now();
+      if (next.generation !== view.generation || !next.connected ||
+          !["running", "waiting"].includes(next.status)) {
+        writes.clear();
+        validationResults.clear();
+      }
       view = next;
       if (pendingProfile &&
           next.profileSelection?.requestId === pendingProfile.requestId &&
@@ -703,6 +757,14 @@ export function installWorld(binding, documentId) {
       }
       render();
       return true;
+    },
+    reconcile(packet) {
+      if (packet.documentId !== documentId || packet.generation !== view.generation ||
+          !["running", "waiting"].includes(view.status)) return [];
+      reviewWrites();
+      const results = [...validationResults.values()];
+      validationResults.clear();
+      return results;
     },
     controlPoint(command) {
       const element = command === "profile" ? profile
@@ -725,6 +787,11 @@ export function installWorld(binding, documentId) {
       if (!el?.isConnected) return { status: "pending", actual: "", reason: "字段已消失或不可访问" };
       if (!matchesExpected(el, packet.expected)) return staleField(el);
       const actual = String(value(el));
+      if (!validValue(el)) {
+        const reason = "页面校验未通过，保留原有内容，请本人修正";
+        pending(el, reason);
+        return { status: "pending", actual, reason };
+      }
       if (actual.trim()) {
         clearPending(el);
         return { status: "preserved", actual, reason: packet.reason };
@@ -788,8 +855,12 @@ export function installWorld(binding, documentId) {
       };
     },
     dispose() {
+      view = { ...view, generation: "", status: "stopped", connected: false };
       clearInterval(lease);
       observer.disconnect();
+      validationObserver.disconnect();
+      writes.clear();
+      validationResults.clear();
       document.removeEventListener("click", onUserClick, true);
       document.removeEventListener("input", onInput, true);
       document.removeEventListener("change", onInput, true);
