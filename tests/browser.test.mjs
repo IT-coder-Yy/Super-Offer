@@ -184,6 +184,33 @@ test("R18 主动断开保留同次填写的逐项快照，同时撤销原网页�
   assert.deepEqual(actual, { before: before.results.length, after: before.results.length, sameRun: true, sameResults: true, active: false, overlay: 0 });
 });
 
+test("R18 已有超长中英文和表情原文留在网页，清单有摘要，尾部仍填写", async (t) => {
+  const { page, connection } = await setup(t);
+  const initial = "长".repeat(11995) + "😀".repeat(7) + "abcd";
+  await page.locator("form").evaluate((form, text) => {
+    form.innerHTML = '<label>姓名<textarea></textarea></label><label>现场留言<textarea></textarea></label><label>GitHub<input id="tail"></label>';
+    for (const el of form.querySelectorAll("textarea")) el.value = text;
+  }, initial);
+  const { results } = await fill(connection, "blank");
+  const actual = { preserved: await page.locator("textarea").evaluateAll((list, text) => list.every((el) => el.value === text), initial), lengths: results.slice(0, 2).map((r) => r.actual.length), summaries: results.slice(0, 2).map((r) => /截取|摘要|仅显示|省略/.test(r.actual + r.reason)), statuses: results.slice(0, 2).map((r) => r.status), tail: await page.locator("#tail").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.ok(actual.lengths.every((size) => size > 0 && size <= 12000));
+  assert.deepEqual({ ...actual, lengths: [] }, { preserved: true, lengths: [], summaries: [true, true], statuses: ["preserved", "preserved"], tail: profile().data.basic.github });
+});
+
+test("恢复历史清单保留旧版合法的长英文原文，新识别的页面值才取摘要", async (t) => {
+  const { page, connection } = await setup(t);
+  const target = (await connection.listTargets()).find((item) => connection.targets.get(item.id) === page);
+  const previous = { fieldId: "old", documentId: "old-document", label: "既有记录", status: "preserved", actual: "a".repeat(12001), reason: "旧版确认", url: server.url };
+  await connection.select({ targetId: target.id, runId: crypto.randomUUID(), profile: profile(), profiles: [], previousResults: [previous], autoAdvance: false });
+  await page.locator("#answer").evaluate((el) => { el.value = "a".repeat(12001); });
+  const { results } = await fill(connection, "blank");
+  assert.equal(results.find((r) => r.fieldId === "old").actual, previous.actual);
+  const current = results.find((r) => r.label === "为何选择此岗位");
+  assert.ok(current.actual.length <= 12000);
+  assert.match(current.actual, /仅显示/);
+});
+
 test("PR2 停止后按钮、草稿、草稿保存和继续均不能重新写，重选可另起任务", async (t) => {
   const { page, connection } = await setup(t);
   const field = (await connection.inspect(true)).find((f) => f.label === "为何选择此岗位");

@@ -178,23 +178,27 @@ fn requires_personal_action(field: &Value) -> bool {
         .iter()
         .any(|word| label.contains(word))
 }
-fn validate_results(state: &BrowserState) -> Result<()> {
+fn validate_results(
+    state: &BrowserState,
+    saved_result: impl Fn(&FieldResult) -> bool,
+) -> Result<()> {
     if state.results.len() > 5000 {
         return Err(AppError::invalid("填写结果超过限制。"));
     }
     for field in &state.results {
-        for (value, label, units, legacy_bytes) in [
-            (&field.label, "字段名称", 400, 1000),
-            (&field.actual, "页面值", 12000, 24000),
-        ] {
-            // 页面按 UTF-16 截取；同时保留旧版按 UTF-8 字节校验合法的备份。
-            if value.contains('\0')
-                || (value.len() > legacy_bytes && value.encode_utf16().count() > units)
-            {
-                return Err(AppError::invalid(&format!(
-                    "{label}超过长度限制或包含无效字符。"
-                )));
-            }
+        if field.label.contains('\0')
+            || (field.label.len() > 1000 && field.label.encode_utf16().count() > 400)
+        {
+            return Err(AppError::invalid("字段名称超过长度限制或包含无效字符。"));
+        }
+        // 旧客户端曾保存整段网页原文。仅备份或原样续跑这些记录时放行。
+        if field.actual.contains('\0')
+            || field.actual.len() > MAX_FRAME
+            || (field.actual.len() > 24000
+                && field.actual.encode_utf16().count() > 12000
+                && !saved_result(field))
+        {
+            return Err(AppError::invalid("页面值超过长度限制或包含无效字符。"));
         }
         text(&field.reason, "填写结果", false, 2000)?;
     }
@@ -430,17 +434,25 @@ impl BrowserHost {
         if state.message.len() > 2000 {
             return Err(AppError::invalid("浏览器结果超过限制。"));
         }
-        validate_results(&state)?;
         let current = self.active_run.lock().map_err(|_| poisoned())?.clone();
         if state.run_id.is_some() && state.run_id != current {
             return Ok(());
         }
-        if let (Some(run_id), Some(version_id)) = (&current, &state.profile_version_id) {
-            let run: FillRun = get(&self.runtime.lock()?.conn, "fill_runs", run_id)?;
+        let saved = state
+            .run_id
+            .as_ref()
+            .map(|id| get::<FillRun>(&self.runtime.lock()?.conn, "fill_runs", id))
+            .transpose()?;
+        if let (Some(run), Some(version_id)) = (&saved, &state.profile_version_id) {
             if &run.profile_version_id != version_id {
                 return Ok(());
             }
         }
+        validate_results(&state, |field| {
+            saved
+                .as_ref()
+                .is_some_and(|run| run.state.results.contains(field))
+        })?;
         let previous = self.state.lock().map_err(|_| poisoned())?.clone();
         if previous.eq(&state) {
             return Ok(());
@@ -1035,7 +1047,7 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
                 return Err(AppError::invalid("填写任务的附件类型不正确。"));
             }
         }
-        validate_results(&run.state)?;
+        validate_results(&run.state, |_| true)?;
     }
     Ok(())
 }
@@ -1584,6 +1596,55 @@ mod tests {
                 state
             );
         }
+    }
+    #[test]
+    fn legacy_long_field_survives_backup_restore_and_resume_in_full() {
+        let (dir, runtime, mut run) = fixture();
+        let host = host(runtime.clone(), dir.path());
+        *host.active_run.lock().unwrap() = Some(run.id.clone());
+        run.state.run_id = Some(run.id.clone());
+        for (i, actual) in ["项".repeat(12001), "🦀".repeat(30000)]
+            .into_iter()
+            .enumerate()
+        {
+            run.state.results.push(FieldResult {
+                field_id: format!("f{i}"),
+                label: "已有项目介绍".into(),
+                actual,
+                status: "preserved".into(),
+                ..Default::default()
+            });
+        }
+        let store = runtime.lock().unwrap();
+        put(&store.conn, "fill_runs", &run.id, &run).unwrap();
+        let archive = crate::backup::export(&store, false, false).unwrap();
+        drop(store);
+        let destination = tempfile::tempdir().unwrap();
+        let mut restored = Store::open(destination.path()).unwrap();
+        let prepared =
+            crate::backup::prepare_path(&restored, std::path::Path::new(&archive.path)).unwrap();
+        let token = prepared.preview.token.clone();
+        crate::backup::commit(&mut restored, prepared, &token, true, false).unwrap();
+        assert_eq!(
+            get::<FillRun>(&restored.conn, "fill_runs", &run.id)
+                .unwrap()
+                .state
+                .results,
+            run.state.results
+        );
+        crate::backup::export(&restored, false, false).unwrap();
+        let mut resumed = run.state.clone();
+        resumed.message = "已继续".into();
+        host.accept_state(resumed.clone()).unwrap();
+        resumed.results[0].actual.push('改');
+        assert!(host.accept_state(resumed).is_err());
+        assert_eq!(
+            get::<FillRun>(&runtime.lock().unwrap().conn, "fill_runs", &run.id)
+                .unwrap()
+                .state
+                .results,
+            run.state.results
+        );
     }
     #[test]
     fn result_limits_preserve_unicode_and_legacy_history_without_poisoning_backups() {

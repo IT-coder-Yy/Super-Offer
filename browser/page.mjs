@@ -373,7 +373,7 @@ export function installWorld(binding, documentId) {
     section: section(el).slice(0, 200),
     type: unsupportedControl(el) || el.type || el.getAttribute("role") || el.tagName.toLowerCase(),
     ...(el.type === "file" && { resumeUpload: resumeUpload(el) }),
-    value: String(value(el)).slice(0, 12000),
+    value: String(value(el)),
     required: required(el),
     disabled: !!el.disabled || !!el.readOnly,
     options:

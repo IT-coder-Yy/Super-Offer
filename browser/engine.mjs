@@ -11,6 +11,11 @@ const stopped = () =>
   });
 const fieldIdentity = ({ id, label, section, type, entryId, entryIndex, autocomplete }) =>
   ({ id, label, section, type, entryId, entryIndex, autocomplete });
+const displayText = (text = "", limit = 12000) => {
+  const suffix = "…（原文过长，仅显示部分）";
+  const shown = text.length > limit ? text.slice(0, limit - suffix.length).toWellFormed() + suffix : text;
+  return shown.toWellFormed().replaceAll("\0", "␀");
+};
 const publicUrl = (raw) => {
   try {
     const u = new URL(raw);
@@ -398,7 +403,10 @@ export class BrowserConnection {
         if (this.status === "running") this.generation = randomUUID();
         this.pauseForLogin(document, false);
       }
-      for (const field of fields) field.fieldToken = this.fieldToken(field);
+      for (const field of fields) {
+        field.fieldToken = this.fieldToken(field);
+        field.value = displayText(field.value);
+      }
       await this.changed();
     }
     return fields;
@@ -446,6 +454,8 @@ export class BrowserConnection {
   record(item) {
     const result = {
       ...item,
+      label: displayText(item.label, 400),
+      actual: displayText(item.actual),
       documentId: this.documentId,
       url: publicUrl(this.page?.url() || ""),
     };
