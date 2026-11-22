@@ -178,6 +178,28 @@ fn requires_personal_action(field: &Value) -> bool {
         .iter()
         .any(|word| label.contains(word))
 }
+fn validate_results(state: &BrowserState) -> Result<()> {
+    if state.results.len() > 5000 {
+        return Err(AppError::invalid("填写结果超过限制。"));
+    }
+    for field in &state.results {
+        for (value, label, units, legacy_bytes) in [
+            (&field.label, "字段名称", 400, 1000),
+            (&field.actual, "页面值", 12000, 24000),
+        ] {
+            // 页面按 UTF-16 截取；同时保留旧版按 UTF-8 字节校验合法的备份。
+            if value.contains('\0')
+                || (value.len() > legacy_bytes && value.encode_utf16().count() > units)
+            {
+                return Err(AppError::invalid(&format!(
+                    "{label}超过长度限制或包含无效字符。"
+                )));
+            }
+        }
+        text(&field.reason, "填写结果", false, 2000)?;
+    }
+    Ok(())
+}
 impl BrowserHost {
     pub fn new(
         runtime: Arc<Runtime>,
@@ -405,9 +427,10 @@ impl BrowserHost {
                 "进度尚未保存，请恢复存储后重试。",
             ));
         }
-        if state.results.len() > 5000 || state.message.len() > 2000 {
+        if state.message.len() > 2000 {
             return Err(AppError::invalid("浏览器结果超过限制。"));
         }
+        validate_results(&state)?;
         let current = self.active_run.lock().map_err(|_| poisoned())?.clone();
         if state.run_id.is_some() && state.run_id != current {
             return Ok(());
@@ -1005,14 +1028,7 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
                 return Err(AppError::invalid("填写任务的附件类型不正确。"));
             }
         }
-        if run.state.results.len() > 5000 {
-            return Err(AppError::invalid("填写结果超过限制。"));
-        }
-        for field in run.state.results {
-            text(&field.label, "字段名称", false, 1000)?;
-            text(&field.actual, "页面值", false, 24000)?;
-            text(&field.reason, "填写结果", false, 2000)?;
-        }
+        validate_results(&run.state)?;
     }
     Ok(())
 }
@@ -1492,6 +1508,109 @@ mod tests {
         );
         assert!(!host.drafts.lock().unwrap().contains_key(&task.id));
         host.shutdown().unwrap();
+    }
+    #[test]
+    fn accepted_long_chinese_result_can_be_exported_and_prepared_for_restore() {
+        let (dir, runtime, run) = fixture();
+        let host = host(runtime.clone(), dir.path());
+        *host.active_run.lock().unwrap() = Some(run.id.clone());
+        let mut state = run.state.clone();
+        state.run_id = Some(run.id.clone());
+        state.results.push(FieldResult {
+            field_id: "f1".into(),
+            label: "项目介绍".into(),
+            status: "filled".into(),
+            actual: "中".repeat(9000),
+            reason: "已回读".into(),
+            ..Default::default()
+        });
+        host.accept_state(state.clone()).unwrap();
+        let store = runtime.lock().unwrap();
+        let saved: FillRun = get(&store.conn, "fill_runs", &run.id).unwrap();
+        assert_eq!(saved.state.results, state.results);
+        let receipt = crate::backup::export(&store, false, false);
+        assert!(
+            receipt.is_ok(),
+            "已接收9000中文/27000字节记录却不能备份：{}",
+            receipt.err().map(|e| e.message).unwrap_or_default()
+        );
+        let prepared =
+            crate::backup::prepare_path(&store, std::path::Path::new(&receipt.unwrap().path))
+                .unwrap();
+        let restored =
+            crate::backup::validate_database(&prepared.staged.path().join("data.sqlite")).unwrap();
+        assert_eq!(
+            get::<FillRun>(&restored, "fill_runs", &run.id)
+                .unwrap()
+                .state
+                .results,
+            state.results
+        );
+    }
+    #[test]
+    fn result_limits_preserve_unicode_and_legacy_history_without_poisoning_backups() {
+        let (dir, runtime, run) = fixture();
+        let host = host(runtime.clone(), dir.path());
+        *host.active_run.lock().unwrap() = Some(run.id.clone());
+        let mut state = run.state.clone();
+        state.run_id = Some(run.id.clone());
+        for (index, (actual, label)) in [
+            ("中".repeat(12000), "中".repeat(400)),
+            ("😀".repeat(6000), "😀".repeat(200)),
+            ("a".repeat(24000), "a".repeat(1000)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.results.push(FieldResult {
+                field_id: "f1".into(),
+                document_id: Some(format!("page-{index}")),
+                url: format!("https://example.invalid/step-{index}"),
+                label,
+                actual,
+                status: "filled".into(),
+                ..Default::default()
+            });
+        }
+        assert_eq!(state.results[0].actual.len(), 36000);
+        assert_eq!(state.results[1].actual.encode_utf16().count(), 12000);
+        host.accept_state(state.clone()).unwrap();
+        for (actual, label) in [
+            ("中".repeat(12001), "合法".into()),
+            ("😀".repeat(6001), "合法".into()),
+            ("a".repeat(24001), "合法".into()),
+            ("合法".into(), "中".repeat(401)),
+            ("合法".into(), "a".repeat(1001)),
+            ("无效\0值".into(), "合法".into()),
+        ] {
+            let mut invalid = state.clone();
+            invalid.results[0].actual = actual;
+            invalid.results[0].label = label;
+            assert!(host.accept_state(invalid).is_err());
+        }
+        let mut too_many = state.clone();
+        too_many.results.resize(5001, FieldResult::default());
+        assert!(host.accept_state(too_many).is_err());
+        let store = runtime.lock().unwrap();
+        assert_eq!(
+            get::<FillRun>(&store.conn, "fill_runs", &run.id)
+                .unwrap()
+                .state
+                .results,
+            state.results
+        );
+        let receipt = crate::backup::export(&store, false, false).unwrap();
+        let prepared =
+            crate::backup::prepare_path(&store, std::path::Path::new(&receipt.path)).unwrap();
+        let restored =
+            crate::backup::validate_database(&prepared.staged.path().join("data.sqlite")).unwrap();
+        assert_eq!(
+            get::<FillRun>(&restored, "fill_runs", &run.id)
+                .unwrap()
+                .state
+                .results,
+            state.results
+        );
     }
     #[test]
     fn panel_profile_switch_commits_only_for_the_selected_run_and_document() {
