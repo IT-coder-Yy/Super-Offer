@@ -1065,6 +1065,252 @@ fn resume_preview_is_bound_to_profile_version_and_rejects_missing_changed_or_ove
 }
 
 #[tokio::test]
+async fn pr18_interview_http_sends_only_confirmed_resume_not_the_structured_profile() {
+    let mut leaks = Vec::new();
+    for mode in ["practice", "simulation"] {
+        for confirmed in [false, true] {
+            let mut replies = vec![
+                Reply::Status(503),
+                Reply::Content(json!({"question":"主问：如何保存状态？","evidenceIds":[]})),
+                Reply::Status(503),
+                Reply::Content(
+                    json!({"question":"追问：保存失败如何处理？","decision":"needs_clarification","evidenceIds":[]}),
+                ),
+                Reply::Content(json!({"question":null,"decision":"sufficient","evidenceIds":[]})),
+            ];
+            if mode == "practice" {
+                replies.extend([Reply::Status(503), Reply::Content(report())]);
+            }
+            replies.extend([Reply::Status(503), Reply::Content(report())]);
+            let server = Server::new(replies);
+            let (_root, runtime, dataset) = fixture();
+            configure(&runtime, &dataset, &server.endpoint);
+            let asset = runtime
+                .lock()
+                .unwrap()
+                .import_asset(
+                    &dataset,
+                    "synthetic.pdf",
+                    b"%PDF-1.4\nPRIVATE_RESUME_BINARY",
+                    AssetKind::Resume,
+                )
+                .unwrap();
+            let profile_data = json!({"basic":{"name":"PRIVATE_NAME","phone":"PRIVATE_PHONE","email":"private-contact@example.invalid","address":"PRIVATE_ADDRESS"},
+                "education":[{"school":"PRIVATE_SCHOOL"}],"experience":[{"company":"PRIVATE_COMPANY"}],"projects":[{"name":"PRIVATE_PROJECT"}],
+                "skills":{"other":"PRIVATE_SKILL"},"certificates":[{"name":"PRIVATE_CERTIFICATE"}],"intentions":{"city":"PRIVATE_INTENTION"},
+                "answers":[{"question":"PRIVATE_QUESTION","answer":"PRIVATE_UNRELATED_ANSWER"}],"resumeAssetId":asset.id});
+            let saved = runtime.lock().unwrap().mutate(&id(),&dataset,serde_json::from_value(json!({"kind":"save_profile","profileId":null,"expectedVersionId":null,"name":"PRIVATE_PROFILE_NAME","data":profile_data})).unwrap()).unwrap();
+            let application = runtime.lock().unwrap().mutate(&id(),&dataset,serde_json::from_value(json!({"kind":"create_application",
+                "job":{"company":"SYNTHETIC_JOB_COMPANY","title":"目标岗位","jd":"EXPLICIT_SELECTED_JD"},"profileVersionId":saved["versionId"],
+                "stage":"saved","duplicateAcknowledged":false})).unwrap()).unwrap();
+            let app: Application = get(
+                &runtime.lock().unwrap().conn,
+                "applications",
+                application["applicationId"].as_str().unwrap(),
+            )
+            .unwrap();
+            let selected_before: ProfileVersion = get(
+                &runtime.lock().unwrap().conn,
+                "profile_versions",
+                saved["versionId"].as_str().unwrap(),
+            )
+            .unwrap();
+            let approved = "明确确认的简历片段 CONFIRMED_RESUME；已确认邮箱 approved-contact@example.invalid；用户原话里的 profile 不应被删除。";
+            let answer_text = "我会先保存状态；回答中的 profile 字段名应当保留。";
+            let host = InterviewHost::new();
+            let created = command(&host,&runtime,&dataset,json!({"kind":"create","operationId":id(),"applicationId":app.id,
+                "profileVersionId":saved["versionId"],"confirmedResume":if confirmed {json!({"assetId":asset.id,"text":approved})} else {Value::Null},
+                "jobSnapshotId":app.job_snapshot_id,"sources":[],"contribution":"EXPLICIT_CONTRIBUTION","role":"AI Agent","stage":"intern","focus":"任务保存",
+                "mode":mode,"questionCount":1,"repracticeOf":null})).unwrap();
+            save_resume_profile(
+                &runtime,
+                &dataset,
+                Some(&asset.id),
+                Some((
+                    saved["profileId"].as_str().unwrap(),
+                    saved["versionId"].as_str().unwrap(),
+                )),
+                "PRIVATE_NEW_VERSION",
+            );
+            let session_id = created["session"]["id"].as_str().unwrap();
+            advance(&host, &runtime, &dataset, &created);
+            let mut current = settled(&host, &runtime, &dataset, session_id).await;
+            assert_eq!(current["session"]["status"], "paused");
+            advance(&host, &runtime, &dataset, &current);
+            current = settled(&host, &runtime, &dataset, session_id).await;
+            command(&host,&runtime,&dataset,json!({"kind":"answer","sessionId":session_id,
+                "expectedRevision":current["session"]["revision"],"operationId":id(),"text":answer_text,"disposition":"answer"})).unwrap();
+            current = settled(&host, &runtime, &dataset, session_id).await;
+            assert_eq!(current["session"]["status"], "paused");
+            advance(&host, &runtime, &dataset, &current);
+            current = settled(&host, &runtime, &dataset, session_id).await;
+            answer(&host, &runtime, &dataset, &current, &id(), "answer");
+            current = settled(&host, &runtime, &dataset, session_id).await;
+            for _ in 0..if mode == "practice" { 2 } else { 1 } {
+                advance(&host, &runtime, &dataset, &current);
+                current = settled(&host, &runtime, &dataset, session_id).await;
+                assert_eq!(current["session"]["status"], "paused");
+                advance(&host, &runtime, &dataset, &current);
+                current = settled(&host, &runtime, &dataset, session_id).await;
+            }
+            assert_eq!(
+                current["session"]["status"], "completed",
+                "{}",
+                current["session"]["error"]
+            );
+            let requests = server.inputs.lock().unwrap();
+            assert_eq!(requests.len(), if mode == "practice" { 9 } else { 7 });
+            for (index, input) in requests.iter().enumerate() {
+                let context: Value =
+                    serde_json::from_str(input.split_once("\n资料：").unwrap().1).unwrap();
+                let leaked =
+                    input.contains("PRIVATE_") || input.contains("private-contact@example.invalid");
+                if leaked {
+                    leaks.push(format!(
+                        "{mode}/confirmed={confirmed}/{}:{}",
+                        index + 1,
+                        context["step"]
+                    ));
+                }
+                assert!(input.contains("EXPLICIT_SELECTED_JD"));
+                assert!(input.contains("EXPLICIT_CONTRIBUTION"));
+                if context["step"] != "question" {
+                    assert_eq!(context["turns"][0]["answer"]["text"], answer_text);
+                }
+                assert_eq!(
+                    context["confirmedResume"],
+                    if confirmed {
+                        json!({"assetId":asset.id,"text":approved})
+                    } else {
+                        Value::Null
+                    }
+                );
+            }
+            drop(requests);
+            let store = runtime.lock().unwrap();
+            let selected_after: ProfileVersion = get(
+                &store.conn,
+                "profile_versions",
+                saved["versionId"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::store::encode(&selected_after).unwrap(),
+                crate::store::encode(&selected_before).unwrap()
+            );
+            for task in list::<ModelTask>(&store.conn, "tasks").unwrap() {
+                assert!(
+                    task.versions
+                        .iter()
+                        .any(|r| r.kind == "profile_version" && r.id == saved["versionId"])
+                );
+                assert!(
+                    task.versions
+                        .iter()
+                        .any(|r| r.kind == "job_snapshot" && r.id == app.job_snapshot_id)
+                );
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "实际 HTTP 请求仍包含未授权整档内容：{leaks:?}"
+    );
+}
+
+#[tokio::test]
+async fn pr18_retry_redacts_a_legacy_profile_only_in_the_new_task_and_unknown_inputs_stop_locally()
+{
+    for recognized in [true, false] {
+        let server = Server::new(vec![
+            Reply::Status(503),
+            Reply::Content(json!({"question":"只使用已确认材料的题目","evidenceIds":[]})),
+        ]);
+        let (_root, runtime, dataset) = fixture();
+        configure(&runtime, &dataset, &server.endpoint);
+        let host = InterviewHost::new();
+        let created = create_session(&host, &runtime, &dataset, "practice", 1);
+        let session_id = created["session"]["id"].as_str().unwrap();
+        advance(&host, &runtime, &dataset, &created);
+        let failed = settled(&host, &runtime, &dataset, session_id).await;
+        let old_id = failed["session"]["pending"]["taskId"].as_str().unwrap();
+        let old_raw = {
+            let store = runtime.lock().unwrap();
+            let mut old: ModelTask = get(&store.conn, "tasks", old_id).unwrap();
+            let (instruction, body) = old.input.text.split_once("\n资料：").unwrap();
+            let mut context: Value = serde_json::from_str(body).unwrap();
+            context["profile"] = json!({"data":{"basic":{"email":"legacy-private@example.invalid"},"answers":[{"answer":"LEGACY_PRIVATE_ANSWER"}]}});
+            context["userContribution"] =
+                json!("原话保留 profile 与资料：这些字符，不应按文字替换。");
+            old.input.text = if recognized {
+                format!("{instruction}\n资料：{context}")
+            } else {
+                "无法识别的旧请求 LEGACY_PRIVATE_ANSWER".into()
+            };
+            crate::store::put(&store.conn, "tasks", old_id, &old).unwrap();
+            store
+                .conn
+                .query_row("SELECT data FROM tasks WHERE id=?1", [old_id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        advance(&host, &runtime, &dataset, &failed);
+        let result = settled(&host, &runtime, &dataset, session_id).await;
+        let actual = server.inputs.lock().unwrap().clone();
+        let store = runtime.lock().unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT data FROM tasks WHERE id=?1", [old_id], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            old_raw,
+            "不能改写旧审计请求"
+        );
+        drop(store);
+        if recognized {
+            assert_eq!(result["session"]["status"], "waiting_answer");
+            assert_eq!(actual.len(), 2);
+            assert!(actual[1].contains("原话保留 profile 与资料："));
+            assert!(
+                !actual[1].contains("LEGACY_PRIVATE_ANSWER")
+                    && !actual[1].contains("legacy-private@example.invalid"),
+                "旧格式重试重新发送了整档"
+            );
+            let context: Value =
+                serde_json::from_str(actual[1].split_once("\n资料：").unwrap().1).unwrap();
+            assert!(context.get("profile").is_none());
+        } else {
+            assert_eq!(result["session"]["status"], "paused");
+            assert_eq!(
+                result["session"]["error"]["code"],
+                "CONTEXT_CONFIRMATION_REQUIRED"
+            );
+            assert_eq!(actual.len(), 1, "无法安全重建的旧输入不能发送");
+            let confirmed = command(&host,&runtime,&dataset,json!({"kind":"confirm_context",
+                "sessionId":session_id,"expectedRevision":result["session"]["revision"],"confirmed":true})).unwrap();
+            advance(&host, &runtime, &dataset, &confirmed);
+            let resumed = settled(&host, &runtime, &dataset, session_id).await;
+            assert_eq!(resumed["session"]["status"], "waiting_answer");
+            let requests = server.inputs.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(!requests[1].contains("LEGACY_PRIVATE_ANSWER"));
+            assert_eq!(
+                runtime
+                    .lock()
+                    .unwrap()
+                    .conn
+                    .query_row("SELECT data FROM tasks WHERE id=?1", [old_id], |r| r
+                        .get::<_, String>(0))
+                    .unwrap(),
+                old_raw
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn confirmed_resume_text_is_opt_in_frozen_to_old_profile_and_survives_backup() {
     let server = Server::new(
         (0..3)
@@ -1217,8 +1463,8 @@ async fn confirmed_resume_text_is_opt_in_frozen_to_old_profile_and_survives_back
     assert!(contexts[2]["confirmedResume"].is_null());
     assert_eq!(contexts[2]["materialGap"], true);
     for request in requests.iter() {
-        assert!(request.contains("OLD_PROFILE_SELECTED"));
         for private in [
+            "OLD_PROFILE_SELECTED",
             "NEVER_SEND_BINARY_OLD",
             "NEVER_SEND_BINARY_NEW",
             "NEW_PROFILE_NOT_SELECTED",
