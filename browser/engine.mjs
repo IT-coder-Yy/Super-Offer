@@ -286,8 +286,14 @@ export class BrowserConnection {
         return;
       }
       if (data.command === "next-destination") {
-        if (this.expectedNavigation?.generation === this.generation) {
-          this.expectDestination(data.url);
+        if (this.expectedNavigation?.generation === this.generation) this.expectDestination(data.url);
+        return;
+      }
+      if (data.command === "next-form") {
+        const next = this.expectedNavigation;
+        if (next?.generation === this.generation && !next.url) {
+          next.formChanged = true;
+          void this.continueForm(next).catch(() => {});
         }
         return;
       }
@@ -412,6 +418,12 @@ export class BrowserConnection {
       }
     }
     this.expectedNavigation = false;
+  }
+  async continueForm(next) {
+    if (this.expectedNavigation !== next || !next.clicked || !next.formChanged) return;
+    this.expectedNavigation = false;
+    if (this.autoAdvance && !this.runStopped && this.generation === next.generation)
+      await this.fill(this.mode || "full", true, true);
   }
   async mount() {
     const page = this.page,
@@ -742,8 +754,7 @@ export class BrowserConnection {
       this.check(generation);
       await this.reconcile();
       this.check(generation);
-      this.expectedNavigation = { generation, url: null };
-      const before = fields.map((x) => x.id).join(",");
+      const navigation = this.expectedNavigation = { generation, url: null };
       const next = await this.evaluate(
         "action",
         this.packet({ action: "next" }),
@@ -755,17 +766,10 @@ export class BrowserConnection {
       }
       if (next.status === "done") {
         this.automaticSteps++;
-        await delay(200);
-        if (generation === this.generation && this.context) {
-          const after = (await this.inspect()).map((x) => x.id).join(",");
-          this.check(generation);
-          if (after !== before) {
-            this.expectedNavigation = false;
-            return this.run(generation, mode);
-          }
-          this.status = "waiting";
-          this.message = "已触发下一步，请核对网站反馈后继续";
-        }
+        this.status = "waiting";
+        this.message = "已触发下一步，请核对网站反馈后继续";
+        navigation.clicked = true;
+        await this.continueForm(navigation);
       } else {
         this.expectedNavigation = false;
         this.status = "waiting";
@@ -1020,7 +1024,7 @@ export class BrowserConnection {
     if (!wasWaiting || save) generation = this.generation = randomUUID();
     await this.changed();
     this.check(generation);
-    this.expectedNavigation = save ? false : { generation, url: null };
+    const navigation = this.expectedNavigation = save ? false : { generation, url: null };
     const runId = this.runId;
     let result;
     try {
@@ -1041,6 +1045,10 @@ export class BrowserConnection {
             ? "已触发明确草稿保存，请核对网站反馈"
             : "已触发下一步，等待页面并重新核对"
           : result.reason;
+      if (navigation && result.status === "done") {
+        navigation.clicked = true;
+        await this.continueForm(navigation);
+      }
     }
     await this.changed();
     return this.state();

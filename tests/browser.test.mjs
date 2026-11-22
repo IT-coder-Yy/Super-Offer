@@ -323,6 +323,110 @@ test("R19 手改无效必填项后马上下一步，旧页按这次回读的值�
   assert.deepEqual(actual, { atNext: { value: "123", marked: false }, status: "preserved", recorded: "123", pending: 0 });
 });
 
+test("R19 同网址六百毫秒后整体换步只填一次，临时增项和人工停止都不会重进下一步", async (t) => {
+  const results = [];
+  for (const mode of ["自动", "手动", "停止"]) {
+    const { page, connection } = await setup(t);
+    await page.locator("form").evaluate((form) => {
+      form.innerHTML = '<label>姓名<input></label><button type="button">下一步</button>';
+      window.clicks = window.writes = 0;
+      form.addEventListener("input", (e) => { if (e.target.id === "tail") window.writes++; });
+      form.querySelector("button").onclick = () => {
+        if (++window.clicks > 1) return;
+        form.insertAdjacentHTML("beforeend", '<label>附注<input></label>');
+        setTimeout(() => {
+          form.innerHTML = '<p>载入下一步</p>';
+          setTimeout(() => { form.innerHTML = '<label>GitHub<input id="tail"></label><button type="submit">最终提交申请</button>'; }, 30);
+        }, 600);
+      };
+    });
+    await connection.fill("full", mode !== "手动");
+    await connection.job;
+    if (mode === "手动") await connection.advance(false);
+    if (mode === "停止") await connection.control("stop");
+    await page.locator("#tail").waitFor();
+    if (mode === "自动") await until(() => connection.results.some((r) => r.label === "GitHub"), "等候第二步填写").catch(() => {});
+    results.push({ mode, value: await page.locator("#tail").inputValue(), ...await page.evaluate(() => ({ clicks: window.clicks, writes: window.writes, submissions: window.submissions })) });
+  }
+  t.diagnostic(JSON.stringify(results));
+  assert.deepEqual(results, [
+    { mode: "自动", value: profile().data.basic.github, clicks: 1, writes: 1, submissions: 0 },
+    { mode: "手动", value: "", clicks: 1, writes: 0, submissions: 0 },
+    { mode: "停止", value: "", clicks: 1, writes: 0, submissions: 0 },
+  ]);
+});
+
+test("R19 表单保留全局字段而只替换局部栏目时，等待本人确认页面进度", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>姓名<input id="name"></label><fieldset><legend>基础栏目</legend><label>邮箱<input type="email"></label></fieldset><button type="button">下一步</button>';
+    const next = form.querySelector("button");
+    window.clicks = 0;
+    next.onclick = () => {
+      window.clicks++;
+      const fieldset = form.querySelector("fieldset");
+      fieldset.innerHTML = '<legend>新增栏目</legend><label>GitHub<input id="tail"></label>';
+      const final = document.createElement("button");
+      final.type = "submit"; final.textContent = "最终提交申请";
+      next.replaceWith(final);
+    };
+  });
+  await connection.fill("full", true);
+  await connection.job;
+  await page.locator("#tail").waitFor();
+  await connection.inspect();
+  await connection.job;
+  const actual = { global: await page.locator("#name").inputValue(), partial: await page.locator("#tail").inputValue(),
+    ...await page.evaluate(() => ({ clicks: window.clicks, submitted: window.submissions })) };
+  await connection.fill("blank", false);
+  await connection.job;
+  actual.afterExplicitFill = await page.locator("#tail").inputValue();
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { global: profile().data.basic.name, partial: "", clicks: 1, submitted: 0,
+    afterExplicitFill: profile().data.basic.github });
+});
+
+test("R19 下一步按钮在点击中变成最终提交也不产生提交事件，正常按钮和链接仍能前进", async (t) => {
+  const rows = [];
+  for (const mode of ["原地变成提交", "普通按钮", "普通链接"]) {
+    const { page, connection } = await setup(t);
+    await page.locator("form").evaluate((form, mode) => {
+      const button = mode === "普通链接" ? '<a href="/step2" role="button">下一步</a>' : '<button type="button">下一步</button>';
+      form.innerHTML = '<label>姓名<input></label>' + button;
+      sessionStorage.setItem("submits", "0");
+      window.addEventListener("submit", (event) => {
+        sessionStorage.setItem("submits", String(Number(sessionStorage.getItem("submits")) + 1));
+        event.preventDefault();
+      }, true);
+      const next = form.querySelector("button");
+      if (mode === "普通按钮") next.onclick = () => { location.href = "/step2"; };
+      if (mode === "原地变成提交") next.onclick = () => {
+        next.type = "submit"; next.textContent = "最终提交"; next.onclick = null;
+      };
+    }, mode);
+    await connection.fill("full", true);
+    await connection.job;
+    let value = "", afterPerson = null;
+    if (mode !== "原地变成提交") {
+      await page.waitForURL("**/step2");
+      await until(() => connection.results.some((r) => r.label === "GitHub"), "普通下一步实际进入第二页");
+      value = await page.locator("#tail").inputValue();
+    }
+    const submitted = await page.evaluate(() => Number(sessionStorage.getItem("submits")));
+    if (mode === "原地变成提交") {
+      await page.getByRole("button", { name: "最终提交" }).click();
+      afterPerson = await page.evaluate(() => Number(sessionStorage.getItem("submits")));
+    }
+    rows.push({ mode, submitted, afterPerson, value });
+  }
+  t.diagnostic(JSON.stringify(rows));
+  assert.deepEqual(rows, [
+    { mode: "原地变成提交", submitted: 0, afterPerson: 1, value: "" },
+    { mode: "普通按钮", submitted: 0, afterPerson: null, value: profile().data.basic.github },
+    { mode: "普通链接", submitted: 0, afterPerson: null, value: profile().data.basic.github },
+  ]);
+});
+
 test("R19 网站拦下下一步链接后本人打开同一地址仍撤权，真实链接跳转则继续", async (t) => {
   const rows = [];
   for (const cancel of [true, false]) {
@@ -426,6 +530,64 @@ test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人"
 {
   const minimal = (name) => { const selected = profile(name); selected.data.education = []; return selected; };
   const result = (connection, label) => connection.results.findLast((item) => item.label === label);
+  test("R19 DOM 原步校验重绘全部控件或追加字段不当作下一步", async (t) => {
+    const rows = [];
+    for (const extra of [false, true]) {
+      const selected = profile(); selected.data.education = [];
+      const { page, connection } = await setup(t, selected);
+      await page.locator("form").evaluate((form, extra) => {
+        form.innerHTML = '<div id="step-fields"><label>姓名<input></label></div><button type="button">下一步</button>';
+        window.nextClicks = window.newWrites = 0;
+        form.addEventListener("input", () => { if (window.redrawn) window.newWrites++; });
+        form.querySelector("button").onclick = () => {
+          if (++window.nextClicks > 1) return;
+          setTimeout(() => {
+            document.getElementById("step-fields").innerHTML = '<label>姓名<input id="redrawn"></label>' + (extra ? '<label>邮箱<input type="email"></label>' : '');
+            window.redrawn = true;
+          }, 600);
+        };
+      }, extra);
+      await connection.fill("full", true); await connection.job;
+      await page.locator("#redrawn").waitFor();
+      await new Promise((resolve) => setTimeout(resolve, 1800));
+      rows.push({ extra, name: await page.locator("#redrawn").inputValue(),
+        ...await page.evaluate(() => ({ nextClicks: window.nextClicks, writes: window.newWrites, submissions: window.submissions })) });
+    }
+    t.diagnostic(JSON.stringify(rows));
+    assert.deepEqual(rows, [false, true].map((extra) => ({ extra, name: "", nextClicks: 1, writes: 0, submissions: 0 })));
+  });
+  test("R19 DOM 常驻步骤按钮不阻断同址换表，复用成最终提交也绝不点击", async (t) => {
+    const rows = [];
+    for (const mode of ["within-final", "outside-final", "outside-next"]) {
+      const selected = profile(); selected.data.education = [];
+      const { page, connection } = await setup(t, selected);
+      await page.locator("form").evaluate((form, mode) => {
+        form.innerHTML = '<div id="step-fields"><label>姓名<input id="first"></label></div>';
+        const button = document.createElement("button"); button.type = "button"; button.textContent = "下一步";
+        (mode === "within-final" ? form : form.parentElement).append(button);
+        window.stepClicks = window.finalClicks = window.newWrites = 0;
+        form.addEventListener("input", (e) => { if (e.target.id !== "first") window.newWrites++; });
+        button.onclick = () => {
+          if (button.textContent === "最终提交申请") { window.finalClicks++; return; }
+          const step = ++window.stepClicks;
+          setTimeout(() => {
+            document.getElementById("step-fields").innerHTML = step === 1
+              ? '<label>GitHub<input id="tail"></label>' : '<label>邮箱<input id="last-email" type="email"></label>';
+            if (mode !== "outside-next" || step === 2) button.textContent = "最终提交申请";
+          }, 600);
+        };
+      }, mode);
+      await connection.fill("full", true); await connection.job;
+      await page.locator("#tail").waitFor();
+      await until(() => connection.results.some((item) => item.label === (mode === "outside-next" ? "邮箱" : "GitHub") && item.status === "filled"), "等待常驻按钮后的下一步填写", 2500).catch(() => {});
+      rows.push({ mode, value: await page.locator(mode === "outside-next" && await page.locator("#last-email").count() ? "#last-email" : "#tail").inputValue(),
+        ...await page.evaluate(() => ({ nextClicks: window.stepClicks, finalClicks: window.finalClicks, writes: window.newWrites, submissions: window.submissions })) });
+    }
+    t.diagnostic(JSON.stringify(rows));
+    assert.deepEqual(rows, ["within-final", "outside-final", "outside-next"].map((mode) => ({ mode,
+      value: mode === "outside-next" ? profile().data.basic.email : profile().data.basic.github,
+      nextClicks: mode === "outside-next" ? 2 : 1, finalClicks: 0, writes: mode === "outside-next" ? 2 : 1, submissions: 0 })));
+  });
   test("R19 DOM 原生同值下拉按具体选项填写并跳过disabled optgroup", async (t) => {
     const snapshots = [];
     for (const disabled of [false, true]) {

@@ -593,10 +593,26 @@ export function installWorld(binding, documentId) {
       }
     }
   };
-  const validationObserver = new MutationObserver(reviewWrites);
+  const fieldMeaning = (field) => JSON.stringify([field.hasCaption ? normalize(field.label) : "",
+    normalize(field.section), field.type, field.autocomplete, field.entryIndex]);
+  const reviewNextForm = () => {
+    const step = pendingNext;
+    if (!step || !step.fields.length || step.generation !== view.generation || step.documentId !== documentId ||
+        location.href !== step.url || !view.connected || Date.now() - lastTick > 6000 ||
+        !["running", "waiting"].includes(view.status) || loginReason()) return;
+    if (step.fields.some((el) => el.isConnected && visible(el))) return;
+    const fields = inspect().fields;
+    if (!fields.length || fields.some((item) => step.ids.has(item.id))) return;
+    const meanings = new Set(fields.map(fieldMeaning));
+    if (![...step.meanings].some((meaning) => !meanings.has(meaning)) ||
+        ![...meanings].some((meaning) => !step.meanings.has(meaning))) return;
+    pendingNext = null;
+    send("next-form");
+  };
+  const validationObserver = new MutationObserver(() => { reviewWrites(); reviewNextForm(); });
   validationObserver.observe(document.documentElement, {
     attributes: true, childList: true, subtree: true,
-    attributeFilter: ["aria-invalid", "disabled", "readonly", "type", "name", "required", "pattern", "value"],
+    attributeFilter: ["aria-invalid", "disabled", "readonly", "type", "name", "required", "pattern", "value", "hidden", "style", "class"],
   });
   const write = async (packet) => {
     const el = elements.get(packet.fieldId);
@@ -786,9 +802,16 @@ export function installWorld(binding, documentId) {
     if (packet.action === "next") {
       reviewWrites();
       reviewInvalidFields();
-      pendingNext = { generation: packet.generation, documentId };
+      const currentFields = inspect().fields, fields = currentFields.map((item) => elements.get(item.id));
+      pendingNext = { generation: packet.generation, documentId, url: location.href,
+        fields, ids: new Set(fields.map(key)), meanings: new Set(currentFields.map(fieldMeaning)) };
     }
-    el.click();
+    // 原生按钮本次只执行站点点击逻辑，不能因 onclick 改成 submit 而顺带最终提交。
+    const nativeButton = ["BUTTON", "INPUT"].includes(el.tagName);
+    const preventButtonDefault = (event) => { if (event.target === el) event.preventDefault(); };
+    if (nativeButton) window.addEventListener("click", preventButtonDefault, true);
+    try { el.click(); }
+    finally { if (nativeButton) window.removeEventListener("click", preventButtonDefault, true); }
     return { status: "done" };
   };
   const onNavigate = (event) => {
@@ -833,6 +856,7 @@ export function installWorld(binding, documentId) {
           !["running", "waiting"].includes(view.status)) return [];
       reviewWrites();
       reviewInvalidFields();
+      reviewNextForm();
       const results = [...validationResults.values()];
       validationResults.clear();
       return results;
