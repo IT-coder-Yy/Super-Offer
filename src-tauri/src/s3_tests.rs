@@ -1310,6 +1310,170 @@ async fn pr18_retry_redacts_a_legacy_profile_only_in_the_new_task_and_unknown_in
     }
 }
 
+#[test]
+fn pr18_bad_submodule_declaration_keeps_other_missing_entries() {
+    let declarations = r#"[submodule "before"]
+path = libs/before
+[submodule "unsafe"]
+path = ../outside
+[submodule "missing-path"]
+url = https://example.invalid/do-not-fetch.git
+[submodule "invalid-escape"]
+path = "libs/invalid\q"
+[submodule "unterminated]
+path = libs/do-not-guess
+[include]
+path = ../do-not-read
+[submodule "inline]name"] path = libs/inline
+[submodule "quoted-value"]
+path = "libs/with \"quote\""
+[submodule "after"]
+path = libs/after
+"#;
+    for directory in [true, false] {
+        let (root, runtime, dataset) = fixture();
+        let project = root.path().join("mixed-declarations");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join(".gitmodules"), declarations).unwrap();
+        let path = if directory {
+            project
+        } else {
+            let path = root.path().join("mixed.zip");
+            zip_file(&path, &[(".gitmodules", declarations.as_bytes())]);
+            path
+        };
+        let host = Arc::new(SourceHost::new());
+        let selection = host.select(&dataset, path, directory).unwrap();
+        let version: SourceVersion = serde_json::from_value(
+            host.handle(
+                &runtime,
+                &dataset,
+                SourceCommand::Import {
+                    token: selection.token,
+                    project_id: None,
+                    name: "局部声明错误".into(),
+                    operation_id: id(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let files = source::files_for(&runtime.lock().unwrap().conn, &version.id).unwrap();
+        let missing = files
+            .iter()
+            .filter(|f| f.status == "failed" && f.reason.contains("声明的子模块"))
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing,
+            [
+                "libs/after/",
+                "libs/before/",
+                "libs/inline/",
+                "libs/with \"quote\"/"
+            ],
+            "directory={directory}"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f.path == ".gitmodules" && f.status == "failed")
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f.path == ".gitmodules" && f.status == "readable")
+        );
+        assert!(!files.iter().any(|f| f.path.contains("outside")
+            || f.path.contains("do-not-read")
+            || f.path.contains("do-not-guess")));
+        let store = runtime.lock().unwrap();
+        crate::backup::export(&store, true, true).unwrap();
+    }
+}
+
+#[test]
+fn pr18_quoted_submodule_names_preserve_all_missing_paths_for_directory_and_zip() {
+    let declarations = r#"[submodule "ordinary"]
+path = libs/ordinary
+[submodule "plugins/[ui]"]
+path = plugins/[ui]
+[submodule "escaped\"quote]and\\slash"]
+path = libs/escaped
+[submodule "hash#;]name"]
+path = "libs/with #; marks"
+[submodule "last"]
+path = libs/last
+"#;
+    let expected = vec![
+        "libs/escaped/",
+        "libs/last/",
+        "libs/ordinary/",
+        "libs/with #; marks/",
+        "plugins/[ui]/",
+    ];
+    let mut failures = Vec::new();
+    for directory in [true, false] {
+        let (root, runtime, dataset) = fixture();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join(".gitmodules"), declarations).unwrap();
+        fs::write(project.join("main.rs"), "fn do_not_execute() {}\n").unwrap();
+        let path = if directory {
+            project.clone()
+        } else {
+            let path = root.path().join("project.zip");
+            zip_file(
+                &path,
+                &[
+                    (".gitmodules", declarations.as_bytes()),
+                    ("main.rs", b"fn do_not_execute() {}\n"),
+                ],
+            );
+            path
+        };
+        let original =
+            fs::read(&path.join(".gitmodules")).unwrap_or_else(|_| fs::read(&path).unwrap());
+        let host = Arc::new(SourceHost::new());
+        let selection = host.select(&dataset, path.clone(), directory).unwrap();
+        let version: SourceVersion = serde_json::from_value(
+            host.handle(
+                &runtime,
+                &dataset,
+                SourceCommand::Import {
+                    token: selection.token,
+                    project_id: None,
+                    name: "声明语法样本".into(),
+                    operation_id: id(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let files = source::files_for(&runtime.lock().unwrap().conn, &version.id).unwrap();
+        let missing = files
+            .iter()
+            .filter(|f| f.status == "failed" && f.reason.contains("声明的子模块"))
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>();
+        if missing != expected
+            || files
+                .iter()
+                .any(|f| f.path == ".gitmodules" && f.status == "failed")
+        {
+            failures.push(format!("directory={directory}: actual={missing:?}"));
+        }
+        assert_eq!(
+            fs::read(&path.join(".gitmodules")).unwrap_or_else(|_| fs::read(&path).unwrap()),
+            original
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "合法声明导致缺失清单被丢弃：{failures:?}"
+    );
+}
+
 #[tokio::test]
 async fn confirmed_resume_text_is_opt_in_frozen_to_old_profile_and_survives_backup() {
     let server = Server::new(

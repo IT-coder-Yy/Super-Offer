@@ -692,29 +692,49 @@ pub fn has_secret(text: &str) -> bool {
 }
 
 // Read declarations only. Never run Git, follow a declaration as a path, or fetch its URL.
-fn submodule_paths(text: &str) -> std::result::Result<Vec<String>, ()> {
+fn submodule_paths(text: &str) -> (Vec<String>, bool) {
     let mut paths = Vec::new();
+    let mut incomplete = false;
     let mut in_module = false;
     let mut has_path = false;
     for line in text.lines() {
-        let line = line.trim();
+        let mut line = line.trim();
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
         }
         if line.starts_with('[') {
             if in_module && !has_path {
-                return Err(());
+                incomplete = true;
             }
-            let (section, tail) = line.strip_prefix('[').unwrap().split_once(']').ok_or(())?;
-            if !tail.trim().is_empty() && !tail.trim().starts_with(['#', ';']) {
-                return Err(());
-            }
+            in_module = false;
+            has_path = false;
+            let mut quoted = false;
+            let mut escaped = false;
+            let end = line.char_indices().skip(1).find_map(|(index, character)| {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' && quoted {
+                    escaped = true;
+                } else if character == '"' {
+                    quoted = !quoted;
+                } else if character == ']' && !quoted {
+                    return Some(index);
+                }
+                None
+            });
+            let Some(end) = end else {
+                incomplete = true;
+                continue;
+            };
+            let (section, tail) = (&line[1..end], &line[end + 1..]);
             let section = section.trim().to_ascii_lowercase();
             in_module = section.starts_with("submodule ")
                 || section.starts_with("submodule\t")
                 || section.starts_with("submodule.");
-            has_path = false;
-            continue;
+            line = tail.trim();
+            if line.is_empty() || line.starts_with(['#', ';']) {
+                continue;
+            }
         }
         if !in_module {
             continue;
@@ -725,7 +745,7 @@ fn submodule_paths(text: &str) -> std::result::Result<Vec<String>, ()> {
                 .next()
                 .is_some_and(|key| key.eq_ignore_ascii_case("path"))
             {
-                return Err(());
+                incomplete = true;
             }
             continue;
         };
@@ -733,54 +753,59 @@ fn submodule_paths(text: &str) -> std::result::Result<Vec<String>, ()> {
             continue;
         }
         if has_path || paths.len() >= MAX_FILES {
-            return Err(());
+            incomplete = true;
+            continue;
         }
-        let mut value = String::new();
-        let mut quoted = false;
-        let mut escaped = false;
-        let mut value_end = 0;
-        for character in raw.trim().chars() {
-            if escaped {
-                value.push(match character {
-                    '\\' | '"' => character,
-                    'n' => '\n',
-                    't' => '\t',
-                    'b' => '\u{8}',
-                    _ => return Err(()),
-                });
-                value_end = value.len();
-                escaped = false;
-            } else {
-                match character {
-                    '\\' => escaped = true,
-                    '"' => {
-                        quoted = !quoted;
+        match submodule_path_value(raw) {
+            Ok(value) => paths.push(value),
+            Err(()) => incomplete = true,
+        }
+        has_path = true;
+    }
+    if in_module && !has_path {
+        incomplete = true;
+    }
+    (paths, incomplete)
+}
+
+fn submodule_path_value(raw: &str) -> std::result::Result<String, ()> {
+    let mut value = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut value_end = 0;
+    for character in raw.trim().chars() {
+        if escaped {
+            value.push(match character {
+                '\\' | '"' => character,
+                'n' => '\n',
+                't' => '\t',
+                'b' => '\u{8}',
+                _ => return Err(()),
+            });
+            value_end = value.len();
+            escaped = false;
+        } else {
+            match character {
+                '\\' => escaped = true,
+                '"' => {
+                    quoted = !quoted;
+                    value_end = value.len();
+                }
+                '#' | ';' if !quoted => break,
+                _ => {
+                    value.push(character);
+                    if quoted || !character.is_whitespace() {
                         value_end = value.len();
-                    }
-                    '#' | ';' if !quoted => break,
-                    _ => {
-                        value.push(character);
-                        if quoted || !character.is_whitespace() {
-                            value_end = value.len();
-                        }
                     }
                 }
             }
         }
-        if quoted || escaped {
-            return Err(());
-        }
-        value.truncate(value_end);
-        if !safe_relative(&value) || value.ends_with('/') {
-            return Err(());
-        }
-        paths.push(value);
-        has_path = true;
     }
-    if in_module && !has_path {
+    value.truncate(value_end);
+    if quoted || escaped || !safe_relative(&value) || value.ends_with('/') {
         return Err(());
     }
-    Ok(paths)
+    Ok(value)
 }
 
 struct PreparedSource {
@@ -913,19 +938,17 @@ impl Collector {
         );
         if path.rsplit('/').next() == Some(".gitmodules") {
             let parent = path.strip_suffix(".gitmodules").unwrap();
-            let parsed = submodule_paths(&content);
+            let (paths, incomplete) = submodule_paths(&content);
             let mut truncated = false;
-            if let Ok(paths) = &parsed {
-                for module in paths {
-                    let path = format!("{parent}{module}/");
-                    if self.submodules.len() >= MAX_FILES && !self.submodules.contains(&path) {
-                        truncated = true;
-                        break;
-                    }
-                    self.submodules.insert(path);
+            for module in paths {
+                let path = format!("{parent}{module}/");
+                if self.submodules.len() >= MAX_FILES && !self.submodules.contains(&path) {
+                    truncated = true;
+                    break;
                 }
+                self.submodules.insert(path);
             }
-            if parsed.is_err() || truncated {
+            if incomplete || truncated {
                 self.record(
                     path,
                     "failed",
