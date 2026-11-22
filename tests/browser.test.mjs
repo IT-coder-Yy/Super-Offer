@@ -530,6 +530,57 @@ test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人"
 {
   const minimal = (name) => { const selected = profile(name); selected.data.education = []; return selected; };
   const result = (connection, label) => connection.results.findLast((item) => item.label === label);
+  test("R19 DOM 初次选定合法章节地址后返回页首仍保留原表填写归属", async (t) => {
+    for (const top of ["#", "history"]) {
+      const selected = profile("甲"); selected.data.education = [];
+      const { page, connection } = await setup(t, selected);
+      const base = page.url();
+      await page.locator("form").evaluate((form, base) => { form.innerHTML = '<label>姓名<input id="name"></label><section id="education">教育经历</section><a id="top" href="' + base + '">返回页首</a>'; }, top === "#" ? "#" : base);
+      await page.evaluate(() => { location.hash = "education"; });
+      await until(() => connection.allowedPages.has(page.url()), "进入原表章节");
+      const target = (await connection.listTargets()).find((item) => connection.targets.get(item.id) === page);
+      await connection.select({ targetId: target.id, runId: crypto.randomUUID(), profile: selected, profiles: [], autoAdvance: false });
+      await connection.fill("full", false); await connection.job;
+      const original = connection.documentId;
+      if (top === "history") await page.goBack(); else await page.locator("#top").click();
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const fields = await connection.inspect();
+      const next = profile("乙"); next.data.education = [];
+      await connection.switchProfile(next, []); await connection.fill("full", false); await connection.job;
+      const actual = { top, sameDocument: connection.documentId === original, owned: fields.find((item) => item.path === "basic.name")?.owned,
+        value: await page.locator("#name").inputValue() };
+      t.diagnostic(JSON.stringify(actual));
+      assert.deepEqual(actual, { top, sameDocument: true, owned: true, value: "乙" });
+    }
+  });
+  test("R19 DOM 无hash绝对地址引发真实新文档时不沿用旧DOM归属", async (t) => {
+    const selected = profile("甲"); selected.data.education = [];
+    const { page, connection } = await setup(t, selected);
+    const base = page.url();
+    await page.locator("form").evaluate((form, base) => {
+      form.innerHTML = '<label>姓名<input id="name"></label><section id="education">教育经历</section><a id="top" href="' + base + '">返回页首</a>';
+      window.originalDocument = true;
+    }, base);
+    await page.evaluate(() => { location.hash = "education"; });
+    await until(() => connection.allowedPages.has(page.url()), "进入原表章节");
+    const target = (await connection.listTargets()).find((item) => connection.targets.get(item.id) === page);
+    await connection.select({ targetId: target.id, runId: crypto.randomUUID(), profile: selected, profiles: [], autoAdvance: false });
+    await connection.fill("full", false); await connection.job;
+    const before = { timeOrigin: await page.evaluate(() => performance.timeOrigin), loaderId: (await connection.session.send("Page.getFrameTree")).frameTree.frame.loaderId };
+    let navigationRequests = 0;
+    page.on("request", (request) => { if (request.isNavigationRequest() && request.frame() === page.mainFrame()) navigationRequests++; });
+    await page.locator("#top").click();
+    await page.waitForFunction(() => !window.originalDocument);
+    await until(() => !connection.context, "实际新文档不得沿用章节world");
+    const after = { timeOrigin: await page.evaluate(() => performance.timeOrigin), loaderId: (await connection.session.send("Page.getFrameTree")).frameTree.frame.loaderId };
+    const actual = { before, after, navigationRequests, value: await page.locator("#name").inputValue(), originalDocument: await page.evaluate(() => !!window.originalDocument) };
+    t.diagnostic(JSON.stringify(actual));
+    assert.notEqual(after.timeOrigin, before.timeOrigin);
+    assert.notEqual(after.loaderId, before.loaderId);
+    assert.equal(navigationRequests, 1);
+    assert.equal(actual.originalDocument, false);
+    assert.equal(actual.value, "");
+  });
   test("R19 DOM 原步校验重绘全部控件或追加字段不当作下一步", async (t) => {
     const rows = [];
     for (const extra of [false, true]) {
@@ -644,6 +695,38 @@ test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人"
       const row = result(connection, "性别"), actual = { refusal, index: await page.locator("#gender").evaluate((el) => el.selectedIndex), status: row.status, value: row.actual };
       t.diagnostic(JSON.stringify(actual));
       assert.deepEqual(actual, { refusal, index: 1, status: "pending", value: "男" });
+    }
+  });
+  test("R19 DOM 岗位hash路由不能借同名章节丢弃岗位归属", async (t) => {
+    const selected = minimal();
+    const { page, connection } = await setup(t, selected);
+    await page.locator("form").evaluate((form) => { form.innerHTML = '<label>姓名<input id="name"></label><section id="education">教育经历</section>'; });
+    await page.evaluate(() => { location.hash = "/jobs/A"; });
+    await until(() => !connection.context, "等待原任务在新岗位路由撤权");
+    const target = (await connection.listTargets()).find((item) => connection.targets.get(item.id) === page);
+    await connection.select({ targetId: target.id, runId: crypto.randomUUID(), profile: selected, profiles: [], autoAdvance: false });
+    await page.evaluate(() => { location.hash = "education"; });
+    await until(() => !connection.context, "不将剥离岗位路由视作同表章节");
+    assert.equal(await page.locator("#super-offer-controls").count(), 0);
+    assert.equal(await page.locator("#name").inputValue(), "");
+  });
+  test("R19 DOM 章节返回原表页首保留归属，换档仍能更新工具填写内容", async (t) => {
+    for (const back of ["history", "top-link"]) {
+      const { page, connection } = await setup(t, minimal("甲"));
+      await page.locator("form").evaluate((form) => { form.innerHTML = '<a id="chapter" href="#education">章节</a><a id="top" href="#">返回页首</a><label>姓名<input id="name"></label><section id="education">教育经历</section>'; });
+      await fill(connection);
+      const original = connection.documentId;
+      await page.locator("#chapter").click();
+      await until(() => connection.allowedPages.has(page.url()), "等待同表章节归属");
+      if (back === "history") await page.goBack(); else await page.locator("#top").click();
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const fields = await connection.inspect();
+      const before = { sameDocument: connection.documentId === original, owned: fields.find((item) => item.path === "basic.name")?.owned };
+      await connection.switchProfile(minimal("乙"), []);
+      await fill(connection);
+      const actual = { back, ...before, name: await page.locator("#name").inputValue(), status: result(connection, "姓名").status };
+      t.diagnostic(JSON.stringify(actual));
+      assert.deepEqual(actual, { back, sameDocument: true, owned: true, name: "乙", status: "updated" });
     }
   });
   test("R19 DOM 下一步前回读手工修正的必填项并清除已解决待办", async (t) => {

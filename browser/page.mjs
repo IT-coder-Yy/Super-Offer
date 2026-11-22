@@ -1,7 +1,8 @@
 // 此函数只在选定页面的 CDP 隔离世界运行；页面主世界没有业务桥接权限。
 export function installWorld(binding, documentId) {
   globalThis.__superOffer?.dispose();
-  let mountedUrl = location.href;
+  const originalUrl = location.href;
+  let mountedUrl = originalUrl;
   const elements = new Map(),
     ids = new WeakMap(),
     owned = new WeakMap(),
@@ -873,7 +874,10 @@ export function installWorld(binding, documentId) {
           .filter((el) => el.id === name || el.getAttribute("name") === name);
         return targets.length === 1 && [...forms].some((form) => form.isConnected && (form === targets[0] || form.contains(targets[0])));
       };
-      if ((previous.hash && !inOriginalForm(previous.hash)) || !inOriginalForm(current.hash)) return false;
+      const original = new URL(originalUrl);
+      const atTop = !current.hash && (!original.hash || inOriginalForm(original.hash)) && previous.hash &&
+        inOriginalForm(previous.hash) && [...forms].some((form) => form.isConnected);
+      if ((previous.hash && !inOriginalForm(previous.hash)) || (!atTop && !inOriginalForm(current.hash))) return false;
       mountedUrl = location.href;
       return true;
     },
