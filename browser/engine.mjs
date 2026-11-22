@@ -9,6 +9,8 @@ const stopped = () =>
   Object.assign(new Error("任务或页面已变化，请重新核对后继续。"), {
     code: "STALE_TASK",
   });
+const fieldIdentity = ({ id, label, section, type, entryId, entryIndex, autocomplete }) =>
+  ({ id, label, section, type, entryId, entryIndex, autocomplete });
 const publicUrl = (raw) => {
   try {
     const u = new URL(raw);
@@ -169,25 +171,45 @@ export class BrowserConnection {
     return list;
   }
   async select(config) {
+    const detaching = this.detach();
+    const selection = this.selection = { runId: config.runId };
+    await detaching;
+    try {
+      if (selection !== this.selection) throw stopped();
+      return await this.bind(config, selection);
+    } catch (error) {
+      if (selection === this.selection) {
+        await this.detach();
+        await this.changed();
+      }
+      throw error;
+    }
+  }
+  async bind(config, selection) {
     const page = this.targets.get(config.targetId);
     if (!page || page.isClosed())
       throw new Error("所选页面已关闭，请刷新页面列表。");
     if (this.listedUrls.get(config.targetId) !== page.url())
       throw new Error("页面地址已变化，请刷新页面列表后重新选择。");
-    await this.detach();
     this.page = page;
     this.targetId = config.targetId;
     this.origin = new URL(page.url()).origin;
     this.profile = config.profile;
     this.profiles = config.profiles;
     this.runId = config.runId;
+    this.runStopped = false;
     this.results = (config.previousResults || []).slice(-5000);
     this.autoAdvance = config.autoAdvance !== false;
     this.generation = randomUUID();
     this.status = "ready";
     this.message = "已连接；填写停在最终提交前";
-    this.allowedPages = new Set([page.url().split("#")[0]]);
-    this.session = await page.context().newCDPSession(page);
+    this.allowedPages = new Set([page.url()]);
+    const session = await page.context().newCDPSession(page);
+    if (selection !== this.selection) {
+      await session.detach();
+      throw stopped();
+    }
+    this.session = session;
     const binding = "__superOfferSend",
       worldName = "super-offer-private-world";
     this.binding = binding;
@@ -211,6 +233,10 @@ export class BrowserConnection {
         data.generation !== this.generation
       )
         return;
+      if (data.command === "user-navigation") {
+        this.expectedNavigation = false;
+        return;
+      }
       if (
         [
           "fill",
@@ -236,26 +262,31 @@ export class BrowserConnection {
         else void this.control(data.command).catch(() => {});
       }
     });
-    await this.session.send("Runtime.enable");
-    await this.session.send("Page.enable");
-    await this.session.send("Runtime.addBinding", {
+    await session.send("Runtime.enable");
+    await session.send("Page.enable");
+    await session.send("Runtime.addBinding", {
       name: binding,
       executionContextName: worldName,
     });
+    if (selection !== this.selection) throw stopped();
     this.navigation = (frame) => {
-      if (frame !== page.mainFrame()) return;
-      const continueFlow = this.expectedNavigation;
-      if (continueFlow && new URL(page.url()).origin === this.origin)
-        this.allowedPages.add(page.url().split("#")[0]);
+      if (frame !== page.mainFrame() || page !== this.page) return;
+      const continueFlow = this.expectedNavigation === this.generation;
+      if (continueFlow && !this.runStopped && new URL(page.url()).origin === this.origin)
+        this.allowedPages.add(page.url());
       this.expectedNavigation = false;
       this.profileSelection = null;
-      this.generation = randomUUID();
+      const generation = this.generation = randomUUID();
+      // 单页路由切换仍共用原文档，撤下旧浮框及事件监听。
+      if (this.context) void this.evaluate("dispose").catch(() => {});
       this.context = null;
-      this.status = "paused";
-      this.message = "页面已变化，重新核对后继续；原有非空内容将保留";
+      if (!this.runStopped) {
+        this.status = "paused";
+        this.message = "页面已变化，重新核对后继续；原有非空内容将保留";
+      }
       void this.mount()
-        .then(() => {
-          if (continueFlow && this.context && this.autoAdvance)
+        .then((mounted) => {
+          if (mounted && continueFlow && generation === this.generation && !this.runStopped && this.autoAdvance)
             return this.fill(this.mode || "full", true, true);
         })
         .catch(() => this.changed());
@@ -270,6 +301,7 @@ export class BrowserConnection {
     };
     page.on("close", this.closeListener);
     const mounted = await this.mount();
+    if (selection !== this.selection) throw stopped();
     this.heartbeat = setInterval(() => void this.changed(), 1500);
     this.heartbeat.unref?.();
     if (mounted && this.page === page && this.context) {
@@ -289,13 +321,13 @@ export class BrowserConnection {
       page.isClosed() ||
       new URL(page.url()).origin !== this.origin
     ) {
-      this.status = "paused";
+      this.status = this.runStopped ? "stopped" : "paused";
       this.message = "页面已离开授权站点，请返回后重新选择目标页";
       await this.changed();
       return false;
     }
-    if (!this.allowedPages.has(page.url().split("#")[0])) {
-      this.status = "paused";
+    if (!this.allowedPages.has(page.url())) {
+      this.status = this.runStopped ? "stopped" : "paused";
       this.message = "页面已离开已确认的申请流程，请刷新页面列表后重新选择";
       await this.changed();
       return false;
@@ -345,23 +377,33 @@ export class BrowserConnection {
   check(generation) {
     if (
       generation !== this.generation ||
+      this.runStopped ||
       this.status !== "running" ||
       !this.context ||
       !this.browser?.isConnected()
     )
       throw stopped();
   }
+  assertActive() {
+    if (this.runStopped || !this.runId) throw stopped();
+  }
+  fieldToken(field) {
+    return createHash("sha256").update(JSON.stringify([
+      this.runId, this.documentId, this.generation, fieldIdentity(field), field.path,
+    ])).digest("hex");
+  }
   async inspect(report = false) {
     const generation = this.generation;
     const document = await this.evaluate("inspect");
+    if (generation !== this.generation) throw stopped();
     const fields = inferMappings(document.fields);
     if (report) {
-      if (generation !== this.generation) throw stopped();
       this.reportInspection(document, fields);
-      if (document.needsLogin) {
+      if (document.needsLogin && !this.runStopped) {
         if (this.status === "running") this.generation = randomUUID();
         this.pauseForLogin(document, false);
       }
+      for (const field of fields) field.fieldToken = this.fieldToken(field);
       await this.changed();
     }
     return fields;
@@ -420,6 +462,7 @@ export class BrowserConnection {
     if (this.results.length > 5000) this.results = this.results.slice(-5000);
   }
   async fill(mode = "full", autoAdvance = this.autoAdvance, automatic = false) {
+    this.assertActive();
     if (this.profileSelection?.status === "pending")
       throw new Error("档案切换尚未确认，请稍后重试或返回客户端核对。");
     if (!["full", "blank"].includes(mode) || !this.profile)
@@ -428,12 +471,12 @@ export class BrowserConnection {
       throw new Error("当前正在填写，可暂停或停止。");
     this.autoAdvance = autoAdvance === true;
     if (!automatic) this.automaticSteps = 0;
-    this.generation = randomUUID();
+    const generation = this.generation = randomUUID();
     this.status = "running";
     this.message = mode === "blank" ? "正在补充空白" : "正在填写";
     this.mode = mode;
     await this.changed();
-    const generation = this.generation;
+    if (generation !== this.generation) throw stopped();
     this.job = this.run(generation, mode)
       .catch((error) => {
         if (generation === this.generation) {
@@ -466,6 +509,7 @@ export class BrowserConnection {
       for (let attempt = 0; attempt < Math.min(wanted, 100); attempt++) {
         this.check(generation);
         const fields = await this.inspect();
+        this.check(generation);
         const matching = fields.filter((x) => x.group === group);
         const present = matching.length
           ? Math.max(...matching.map((x) => x.index)) + 1
@@ -475,6 +519,7 @@ export class BrowserConnection {
           "action",
           this.packet({ action: "add", labels: addLabels[group] }),
         );
+        this.check(generation);
         if (result.status !== "done") {
           if (matching.length)
             this.record({
@@ -487,7 +532,9 @@ export class BrowserConnection {
           break;
         }
         await delay(100);
+        this.check(generation);
         const after = (await this.inspect()).filter((x) => x.group === group);
+        this.check(generation);
         const count = after.length
           ? Math.max(...after.map((x) => x.index)) + 1
           : 0;
@@ -547,10 +594,12 @@ export class BrowserConnection {
         this.packet({ fieldId: field.id, value: content, mode }),
       );
       this.check(generation);
+      if (result.status === "stale") throw stopped();
       if (this.pauseForLogin(result)) return;
       await delay(30);
       this.check(generation);
       const readback = await this.evaluate("fieldState", field.id);
+      this.check(generation);
       if (
         ["filled", "updated"].includes(result.status) &&
         (!readback ||
@@ -571,14 +620,14 @@ export class BrowserConnection {
       this.automaticSteps < 50
     ) {
       this.check(generation);
-      this.expectedNavigation = true;
+      this.expectedNavigation = generation;
       const before = fields.map((x) => x.id).join(",");
       const next = await this.evaluate(
         "action",
         this.packet({ action: "next" }),
       );
+      this.check(generation);
       if (next.needsLogin) {
-        this.check(generation);
         this.pauseForLogin(next);
         return;
       }
@@ -588,6 +637,7 @@ export class BrowserConnection {
         if (generation === this.generation && this.context) {
           this.expectedNavigation = false;
           const after = (await this.inspect()).map((x) => x.id).join(",");
+          this.check(generation);
           if (after !== before) return this.run(generation, mode);
           this.status = "waiting";
           this.message = "已触发下一步，请核对网站反馈后继续";
@@ -600,6 +650,7 @@ export class BrowserConnection {
     }
   }
   async requestProfile(versionId, requestId) {
+    this.assertActive();
     if (
       !this.profiles.some((x) => x.id === versionId) ||
       typeof requestId !== "string" || requestId.length > 100 ||
@@ -637,8 +688,8 @@ export class BrowserConnection {
     this.profile = profile;
     this.profiles = profiles;
     this.profileSelection = previous ? { ...previous, status: "applied" } : null;
-    this.status = previous?.stopped ? "stopped" : "ready";
-    this.message = previous?.stopped
+    this.status = this.runStopped ? "stopped" : "ready";
+    this.message = this.runStopped
       ? "档案已切换；任务仍已停止，网页未改动"
       : "已切换档案，网页未改动；再次填写时检查归属和缺值";
     await this.changed();
@@ -655,10 +706,13 @@ export class BrowserConnection {
   }
   async control(action, runId = null) {
     if (runId && runId !== this.runId) throw stopped();
+    if (this.runStopped && action === "stop") return this.state();
+    this.assertActive();
     if (action === "resume") return this.fill(this.mode || "full");
     if (!["pause", "stop"].includes(action))
       throw new Error("不支持的填写控制");
     this.expectedNavigation = false;
+    this.runStopped = action === "stop";
     if (action === "stop" && this.profileSelection?.status === "pending")
       this.profileSelection.stopped = true;
     this.generation = randomUUID();
@@ -670,22 +724,39 @@ export class BrowserConnection {
     await this.changed();
     return this.state();
   }
-  async applyDraft(fieldId, content) {
+  async applyDraft(fieldId, content, fieldToken) {
+    this.assertActive();
+    if (typeof fieldToken !== "string" || !fieldToken) throw stopped();
     if (
       typeof content !== "string" ||
       !content.trim() ||
       content.length > 12000
     )
       throw new Error("建议内容无效");
-    this.generation = randomUUID();
+    const inspected = this.generation;
+    const document = await this.evaluate("inspect");
+    if (inspected !== this.generation) throw stopped();
+    if (this.pauseForLogin(document)) {
+      await this.changed();
+      return this.state();
+    }
+    const field = inferMappings(document.fields).find((item) => item.id === fieldId);
+    if (!field || fieldToken !== this.fieldToken(field)) throw stopped();
+    const generation = this.generation = randomUUID();
     this.status = "running";
     await this.changed();
-    const generation = this.generation;
+    this.check(generation);
     const result = await this.evaluate(
       "write",
-      this.packet({ fieldId, value: content, mode: this.mode || "full" }),
+      this.packet({ fieldId, expected: fieldIdentity(field), value: content, mode: this.mode || "full" }),
     );
     this.check(generation);
+    if (result.status === "stale") {
+      this.status = "paused";
+      this.message = "题目已变化，请重新检查后确认写入";
+      await this.changed();
+      throw stopped();
+    }
     if (!this.pauseForLogin(result)) {
       this.record(result);
       this.status = "waiting";
@@ -782,29 +853,39 @@ export class BrowserConnection {
     }
   }
   async replaceAttachment(fieldId, confirmed) {
+    this.assertActive();
     if (!confirmed) throw new Error("替换附件需要确认");
     if (this.profileSelection?.status === "pending") throw new Error("档案切换尚未确认，请稍后重试");
-    this.generation = randomUUID();
+    const generation = this.generation = randomUUID();
     this.status = "running";
     await this.changed();
-    await this.upload(fieldId, true);
+    this.check(generation);
+    await this.upload(fieldId, true, generation);
+    if (generation !== this.generation) throw stopped();
     if (this.status === "running") this.status = "waiting";
     await this.changed();
     return this.state();
   }
   async advance(save) {
-    this.generation = randomUUID();
+    this.assertActive();
+    const generation = this.generation = randomUUID();
     this.status = "running";
     await this.changed();
-    this.expectedNavigation = !save;
-    const generation = this.generation;
-    const result = await this.evaluate(
-      "action",
-      this.packet({ action: save ? "save" : "next", confirmed: !!save }),
-    );
+    this.check(generation);
+    this.expectedNavigation = save ? false : generation;
+    const runId = this.runId;
+    let result;
+    try {
+      result = await this.evaluate("action", this.packet({ action: save ? "save" : "next", confirmed: !!save }));
+    } catch (error) {
+      // 单页网站可能在点击返回前同步换步，原隔离世界已被撤下。
+      if (runId === this.runId && generation !== this.generation) return this.state();
+      throw error;
+    }
+    if (!save && result.status === "done" && generation === this.generation) await delay(200);
     if (generation !== this.generation) return this.state();
     this.check(generation);
-    if (result.status !== "done") this.expectedNavigation = false;
+    this.expectedNavigation = false;
     if (!this.pauseForLogin(result)) {
       this.status = "waiting";
       this.message =
@@ -818,20 +899,29 @@ export class BrowserConnection {
     return this.state();
   }
   async detach() {
+    this.selection = null;
     this.generation = randomUUID();
     this.profileSelection = null;
+    this.expectedNavigation = false;
     clearInterval(this.heartbeat);
     this.heartbeat = null;
-    if (this.page) {
-      this.page.off("framenavigated", this.navigation);
-      this.page.off("close", this.closeListener);
-    }
-    if (this.context) await this.evaluate("dispose").catch(() => {});
+    if (this.page && this.navigation) this.page.off("framenavigated", this.navigation);
+    if (this.page && this.closeListener) this.page.off("close", this.closeListener);
+    const disposing = this.context && this.evaluate("dispose").catch(() => {});
+    const session = this.session;
     this.context = null;
-    if (this.session) await this.session.detach().catch(() => {});
     this.session = null;
     this.page = null;
     this.targetId = null;
+    this.documentId = null;
+    this.runId = null;
+    this.profile = null;
+    this.profiles = [];
+    this.results = [];
+    this.status = this.browser?.isConnected() ? "connected" : "disconnected";
+    this.message = this.status === "connected" ? "请选择本次申请页面" : "尚未连接浏览器";
+    await disposing;
+    if (session) await session.detach().catch(() => {});
   }
   async disconnect() {
     await this.detach();
@@ -843,6 +933,8 @@ export class BrowserConnection {
     this.emit({ event: "state", state: this.state() });
   }
   async dispatch(command) {
+    if (["fill", "draft", "upload", "advance", "inspect"].includes(command.kind) &&
+        command.runId && command.runId !== this.runId) throw stopped();
     switch (command.kind) {
       case "connect":
         return this.connect(command.channel);
@@ -850,6 +942,15 @@ export class BrowserConnection {
         return this.listTargets();
       case "select":
         return this.select(command);
+      case "unselect":
+        if (command.runId) {
+          const active = this.runId || this.selection?.runId;
+          if (!active) return this.state();
+          if (command.runId !== active) throw stopped();
+        }
+        await this.detach();
+        await this.changed();
+        return this.state();
       case "state":
         return this.state();
       case "inspect":
@@ -865,7 +966,8 @@ export class BrowserConnection {
       case "profile_failed":
         return this.profileFailed(command.runId, command.requestId, command.message);
       case "draft":
-        return this.applyDraft(command.fieldId, command.value);
+        if (!command.runId) throw stopped();
+        return this.applyDraft(command.fieldId, command.value, command.fieldToken);
       case "upload":
         return this.replaceAttachment(command.fieldId, command.confirmed);
       case "advance":

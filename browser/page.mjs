@@ -1,6 +1,7 @@
 // 此函数只在选定页面的 CDP 隔离世界运行；页面主世界没有业务桥接权限。
 export function installWorld(binding, documentId) {
   globalThis.__superOffer?.dispose();
+  const mountedUrl = location.href;
   const elements = new Map(),
     ids = new WeakMap(),
     owned = new WeakMap(),
@@ -144,14 +145,14 @@ export function installWorld(binding, documentId) {
         (pendingProfile || shadow.activeElement !== profile)) profile.value = selected;
     const expired = Date.now() - lastTick > 6000;
     const connected = view.connected && !expired;
-    profile.disabled = !connected || !!pendingProfile;
+    profile.disabled = !connected || !!pendingProfile || view.status === "stopped";
     status.textContent = expired
       ? "连接已断开，请返回客户端重新连接"
       : pendingProfile
         ? "正在切换档案，确认后才能填写；未完成可返回客户端核对"
         : `${view.profileName || "未选档案"} · ${view.message || view.status} · 已填 ${view.filled || 0} · 待处理 ${view.pending || 0}`;
     for (const [command, button] of buttons) {
-      button.disabled = command !== "return" && (!connected ||
+      button.disabled = command !== "return" && (!connected || view.status === "stopped" ||
         (["fill", "blank", "resume"].includes(command) && (!!pendingProfile || view.status === "running")));
     }
   };
@@ -178,6 +179,10 @@ export function installWorld(binding, documentId) {
         for (const el of radios(event.target)) touched.add(el);
     }
   };
+  const onUserClick = (event) => {
+    if (event.isTrusted && event.target !== host && view.status === "running") send("user-navigation");
+  };
+  document.addEventListener("click", onUserClick, true);
   document.addEventListener("input", onInput, true);
   document.addEventListener("change", onInput, true);
   const normalize = (x) =>
@@ -461,7 +466,7 @@ export function installWorld(binding, documentId) {
     }
   };
   const safe = (packet) =>
-    packet.documentId === documentId &&
+    location.href === mountedUrl && packet.documentId === documentId &&
     packet.generation === view.generation &&
     view.status === "running";
   const write = (packet) => {
@@ -482,6 +487,11 @@ export function installWorld(binding, documentId) {
     const login = loginReason();
     if (login) return { ...result, reason: login, needsLogin: true };
     if (!el?.isConnected || !visible(el)) return fail("字段已消失或不可访问");
+    if (packet.expected) {
+      const now = field(el);
+      if (Object.entries(packet.expected).some(([key, expected]) => now[key] !== expected))
+        return { ...result, status: "stale", reason: "当前字段已变化，请重新检查" };
+    }
     if (touched.has(el)) return fail("用户手动修改优先");
     if (unsupportedControl(el)) return fail("自定义选项或复合控件请本人操作，不向内部输入框写入资料");
     if (el.disabled || el.readOnly) return fail("字段不可写");
@@ -729,6 +739,7 @@ export function installWorld(binding, documentId) {
     dispose() {
       clearInterval(lease);
       observer.disconnect();
+      document.removeEventListener("click", onUserClick, true);
       document.removeEventListener("input", onInput, true);
       document.removeEventListener("change", onInput, true);
       host.remove();

@@ -620,6 +620,7 @@ export function BrowserPanel({
                         const task = await call<ModelTask>({
                           kind: "draft",
                           fieldId,
+                          fieldToken: selectedField.fieldToken,
                         });
                         setDraftId(task.id);
                         await reload();
@@ -651,6 +652,7 @@ export function BrowserPanel({
                                 confirmed: true,
                               });
                               setDraftId("");
+                              await inspect();
                             },
                           )
                         }
@@ -715,10 +717,12 @@ export function BrowserPanel({
                           await call({
                             kind: "write_answer",
                             fieldId,
+                            fieldToken: selectedField.fieldToken,
                             value: answer,
                             confirmed: true,
                           });
                           setAnswer("");
+                          await inspect();
                         },
                       )
                     }

@@ -108,6 +108,7 @@ pub enum BrowserCommand {
     Inspect,
     Draft {
         field_id: String,
+        field_token: String,
     },
     ApplyDraft {
         task_id: String,
@@ -115,6 +116,7 @@ pub enum BrowserCommand {
     },
     WriteAnswer {
         field_id: String,
+        field_token: String,
         value: String,
         confirmed: bool,
     },
@@ -139,6 +141,7 @@ struct DraftTarget {
     document_id: String,
     generation: String,
     field_id: String,
+    field_token: String,
 }
 pub struct BrowserHost {
     runtime: Arc<Runtime>,
@@ -506,6 +509,53 @@ impl BrowserHost {
             .ok_or_else(|| AppError::invalid("请先选择本次申请页面。"))?;
         get(&self.runtime.lock()?.conn, "fill_runs", &run_id)
     }
+    fn clear_selection(&self) -> Result<Option<String>> {
+        let old = self.active_run.lock().map_err(|_| poisoned())?.take();
+        self.drafts.lock().map_err(|_| poisoned())?.clear();
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        *state = BrowserState {
+            connected: state.connected,
+            generation: id(),
+            status: "ready".into(),
+            message: "请重新选择本次申请页面。".into(),
+            ..Default::default()
+        };
+        drop(state);
+        (self.observer)(BrowserEvent::Changed);
+        Ok(old)
+    }
+    fn select_page(
+        self: &Arc<Self>,
+        dataset: &str,
+        prepare: impl FnOnce() -> Result<(String, Value)>,
+    ) -> Result<Value> {
+        let _selection = self.profile_switch.lock().map_err(|_| poisoned())?;
+        // 先撤销旧页，再尝试新页；失败不能保留旧页的填写权。
+        if let Some(old) = self.clear_selection()? {
+            if let Err(error) = self.call(json!({"kind":"unselect","runId":old})) {
+                if error.code != "STALE_TASK" {
+                    self.shutdown()?;
+                    return Err(error);
+                }
+            }
+            self.runtime
+                .cancel_context(dataset, &format!("fill:{old}"))?;
+        }
+        self.dataset(dataset)?;
+        let (run_id, command) = prepare()?;
+        *self.active_run.lock().map_err(|_| poisoned())? = Some(run_id.clone());
+        let result = self.call(command);
+        if result.is_err() {
+            let cleared = self.call(json!({"kind":"unselect","runId":run_id}));
+            self.clear_selection()?;
+            if cleared.is_err_and(|error| error.code != "STALE_TASK") {
+                self.shutdown()?;
+            }
+            self.runtime
+                .cancel_context(dataset, &format!("fill:{run_id}"))?;
+        }
+        result
+    }
     fn profile(
         &self,
         version_id: &str,
@@ -668,45 +718,35 @@ impl BrowserHost {
                 application_id,
                 selection,
             } => {
-                text(&target_id, "目标页面", true, 200)?;
-                let (data, profile) = self.profile(&profile_version_id, selection)?;
-                let run = FillRun {
-                    id: id(),
-                    dataset_id: dataset.into(),
-                    profile_version_id: profile_version_id.clone(),
-                    application_id,
-                    selection: data,
-                    created_at: now(),
-                    updated_at: now(),
-                    state: BrowserState {
-                        status: "ready".into(),
-                        ..Default::default()
-                    },
-                };
-                {
-                    let mut store = self.runtime.lock()?;
-                    if store.dataset_id != dataset {
-                        return Err(AppError::new("STALE_TASK", "数据已变化。"));
-                    }
-                    if let Some(application) = &run.application_id {
-                        let _: Application = get(&store.conn, "applications", application)?;
-                    }
-                    let tx = store.conn.transaction()?;
-                    put(&tx, "fill_runs", &run.id, &run)?;
-                    bump(&tx)?;
-                    tx.commit()?;
-                }
-                if let Some(old) = self
-                    .active_run
-                    .lock()
-                    .map_err(|_| poisoned())?
-                    .replace(run.id.clone())
-                {
-                    self.runtime
-                        .cancel_context(dataset, &format!("fill:{old}"))?;
-                }
-                self.drafts.lock().map_err(|_| poisoned())?.clear();
-                self.request(json!({"kind":"select","targetId":target_id,"runId":run.id,"profile":profile,"profiles":self.profiles()?})).await
+                let host = self.clone();
+                let dataset = dataset.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    host.select_page(&dataset, || {
+                        text(&target_id, "目标页面", true, 200)?;
+                        let (data, profile) = host.profile(&profile_version_id, selection)?;
+                        let run = FillRun {
+                            id: id(), dataset_id: dataset.clone(),
+                            profile_version_id: profile_version_id.clone(), application_id,
+                            selection: data, created_at: now(), updated_at: now(),
+                            state: BrowserState { status: "ready".into(), ..Default::default() },
+                        };
+                        {
+                            let mut store = host.runtime.lock()?;
+                            if store.dataset_id != dataset {
+                                return Err(AppError::new("STALE_TASK", "数据已变化。"));
+                            }
+                            if let Some(application) = &run.application_id {
+                                let _: Application = get(&store.conn, "applications", application)?;
+                            }
+                            let tx = store.conn.transaction()?;
+                            put(&tx, "fill_runs", &run.id, &run)?;
+                            bump(&tx)?;
+                            tx.commit()?;
+                        }
+                        let command = json!({"kind":"select","targetId":target_id,"runId":run.id,"profile":profile,"profiles":host.profiles()?});
+                        Ok((run.id, command))
+                    })
+                }).await.map_err(|_| poisoned())?
             }
             BrowserCommand::SwitchProfile {
                 profile_version_id,
@@ -721,29 +761,28 @@ impl BrowserHost {
                 .map_err(|_| poisoned())?
             }
             BrowserCommand::ResumeRun { run_id, target_id } => {
-                let run: FillRun = get(&self.runtime.lock()?.conn, "fill_runs", &run_id)?;
-                if run.dataset_id != dataset {
-                    return Err(AppError::new("STALE_TASK", "填写记录属于旧数据集。"));
-                }
-                let (_, profile) = self.profile(&run.profile_version_id, Some(run.selection))?;
-                if let Some(old) = self
-                    .active_run
-                    .lock()
-                    .map_err(|_| poisoned())?
-                    .replace(run.id.clone())
-                {
-                    self.runtime
-                        .cancel_context(dataset, &format!("fill:{old}"))?;
-                }
-                self.drafts.lock().map_err(|_| poisoned())?.clear();
-                self.request(json!({"kind":"select","targetId":target_id,"runId":run.id,"profile":profile,"profiles":self.profiles()?,"previousResults":run.state.results})).await
+                let host = self.clone();
+                let dataset = dataset.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    host.select_page(&dataset, || {
+                        let run: FillRun = get(&host.runtime.lock()?.conn, "fill_runs", &run_id)?;
+                        if run.dataset_id != dataset {
+                            return Err(AppError::new("STALE_TASK", "填写记录属于旧数据集。"));
+                        }
+                        text(&target_id, "目标页面", true, 200)?;
+                        let (_, profile) = host.profile(&run.profile_version_id, Some(run.selection))?;
+                        let command = json!({"kind":"select","targetId":target_id,"runId":run.id,"profile":profile,"profiles":host.profiles()?,"previousResults":run.state.results});
+                        Ok((run.id, command))
+                    })
+                }).await.map_err(|_| poisoned())?
             }
             BrowserCommand::Fill { mode } => {
-                self.current_run(dataset)?;
+                let run = self.current_run(dataset)?;
                 if !["full", "blank"].contains(&mode.as_str()) {
                     return Err(AppError::invalid("填写模式不正确。"));
                 }
-                self.request(json!({"kind":"fill","mode":mode})).await
+                self.request(json!({"kind":"fill","runId":run.id,"mode":mode}))
+                    .await
             }
             BrowserCommand::Control { action } => {
                 if action == "return" {
@@ -759,12 +798,15 @@ impl BrowserHost {
                             .cancel_context(dataset, &format!("fill:{}", run.id))?;
                         self.drafts.lock().map_err(|_| poisoned())?.clear();
                     }
-                    self.request(json!({"kind":"control","action":action}))
+                    self.request(json!({"kind":"control","runId":run.id,"action":action}))
                         .await
                 }
             }
             BrowserCommand::Inspect => self.request(json!({"kind":"inspect"})).await,
-            BrowserCommand::Draft { field_id } => {
+            BrowserCommand::Draft {
+                field_id,
+                field_token,
+            } => {
                 let run = self.current_run(dataset)?;
                 let state = self.state.lock().map_err(|_| poisoned())?.clone();
                 if !state.connected
@@ -772,11 +814,19 @@ impl BrowserHost {
                 {
                     return Err(AppError::invalid("请先恢复本次任务，再生成建议。"));
                 }
-                let fields = self.request(json!({"kind":"inspect"})).await?;
+                let fields = self
+                    .request(json!({"kind":"inspect","runId":run.id}))
+                    .await?;
                 let field = fields
                     .as_array()
                     .and_then(|xs| xs.iter().find(|x| x["id"].as_str() == Some(&field_id)))
                     .ok_or_else(|| AppError::invalid("所选字段已变化，请刷新。"))?;
+                if field_token.is_empty() || field["fieldToken"].as_str() != Some(&field_token) {
+                    return Err(AppError::new(
+                        "STALE_TASK",
+                        "所选问题或页面已变化，请重新核对字段。",
+                    ));
+                }
                 if requires_personal_action(field) {
                     return Err(AppError::invalid("附件或本人确认事项不能交给模型代办。"));
                 }
@@ -785,6 +835,7 @@ impl BrowserHost {
                 let current = self.state.lock().map_err(|_| poisoned())?.clone();
                 if current.generation != state.generation
                     || current.document_id != state.document_id
+                    || current.run_id.as_deref() != Some(&run.id)
                 {
                     return Err(AppError::new(
                         "STALE_TASK",
@@ -811,6 +862,7 @@ impl BrowserHost {
                     document_id: state.document_id.unwrap_or_default(),
                     generation: state.generation,
                     field_id,
+                    field_token,
                 };
                 self.drafts
                     .lock()
@@ -848,17 +900,18 @@ impl BrowserHost {
                     return Err(AppError::invalid("建议尚未完成或已取消，不能写入。"));
                 }
                 let result = self
-                    .request(json!({"kind":"draft","fieldId":target.field_id,"value":task.content}))
+                    .request(json!({"kind":"draft","runId":target.run_id,"fieldId":target.field_id,"fieldToken":target.field_token,"value":task.content}))
                     .await?;
                 self.drafts.lock().map_err(|_| poisoned())?.remove(&task_id);
                 Ok(result)
             }
             BrowserCommand::WriteAnswer {
                 field_id,
+                field_token,
                 value,
                 confirmed,
             } => {
-                self.current_run(dataset)?;
+                let run = self.current_run(dataset)?;
                 if !confirmed {
                     return Err(AppError::new(
                         "CONFIRMATION_REQUIRED",
@@ -866,29 +919,30 @@ impl BrowserHost {
                     ));
                 }
                 text(&value, "回答", true, 12000)?;
-                self.request(json!({"kind":"draft","fieldId":field_id,"value":value}))
+                text(&field_token, "字段凭据", true, 200)?;
+                self.request(json!({"kind":"draft","runId":run.id,"fieldId":field_id,"fieldToken":field_token,"value":value}))
                     .await
             }
             BrowserCommand::Upload {
                 field_id,
                 confirmed,
             } => {
-                self.current_run(dataset)?;
-                self.request(json!({"kind":"upload","fieldId":field_id,"confirmed":confirmed}))
+                let run = self.current_run(dataset)?;
+                self.request(json!({"kind":"upload","runId":run.id,"fieldId":field_id,"confirmed":confirmed}))
                     .await
             }
             BrowserCommand::Advance {
                 save_draft,
                 confirmed,
             } => {
-                self.current_run(dataset)?;
+                let run = self.current_run(dataset)?;
                 if !confirmed {
                     return Err(AppError::new(
                         "CONFIRMATION_REQUIRED",
                         "下一步或保存草稿可能把资料发给网站，请确认后继续。",
                     ));
                 }
-                self.request(json!({"kind":"advance","saveDraft":save_draft}))
+                self.request(json!({"kind":"advance","runId":run.id,"saveDraft":save_draft}))
                     .await
             }
             BrowserCommand::Disconnect => {
@@ -1052,6 +1106,392 @@ mod tests {
         let script = dir.join("controlled-host.mjs");
         std::fs::write(&script,"import{createInterface}from'node:readline';createInterface({input:process.stdin}).on('line',l=>{const p=JSON.parse(l);process.stdout.write(JSON.stringify({id:p.id,result:{ok:true}})+'\\n');});").unwrap();
         BrowserHost::new(runtime, node(), script, Arc::new(|_| {}))
+    }
+    fn boundary_host(
+        runtime: Arc<Runtime>,
+        dir: &std::path::Path,
+        run: &FillRun,
+    ) -> Arc<BrowserHost> {
+        let script = dir.join("controlled-boundaries.mjs");
+        let mut state = run.state.clone();
+        state.run_id = Some(run.id.clone());
+        state.profile_version_id = Some(run.profile_version_id.clone());
+        let source = r#"
+            import { createInterface } from 'node:readline';
+            let state = INITIAL_STATE;
+            let question = '问题A', fieldToken = 'document-A-question-A';
+            const writes = [];
+            createInterface({input:process.stdin}).on('line', line => {
+                const {id, command:c} = JSON.parse(line);
+                let result = {ok:true}, error;
+                if(c.kind === 'select') {
+                    if(c.targetId === 'missing-target') error = {code:'TARGET_GONE',message:'受控目标已关闭'};
+                    else {
+                        state = {...state,connected:true,runId:c.runId,targetId:c.targetId,documentId:'selected-document',generation:'selected-generation',profileVersionId:c.profile.id};
+                        process.stdout.write(JSON.stringify({event:'state',state})+'\n');
+                    }
+                }
+                if(c.kind === 'inspect') result = [{id:'f1',label:question,section:'开放题',type:'textarea',options:[],fieldToken}];
+                if(c.kind === 'navigate') {
+                    state = {...state,documentId:'document-B',generation:'generation-B'};
+                    question = '问题B'; fieldToken = 'document-B-question-B';
+                    process.stdout.write(JSON.stringify({event:'state',state})+'\n');
+                }
+                if(c.kind === 'relabel') {question = '问题B'; fieldToken = 'document-A-question-B';}
+                if(c.kind === 'unselect') {
+                    if(c.runId && c.runId !== state.runId) error = {code:'STALE_TASK',message:'受控任务已撤销'};
+                    else state = {...state,runId:null,documentId:null};
+                }
+                if(c.kind === 'disconnect') state = {...state,runId:null,documentId:null,connected:false};
+                if(['fill','draft'].includes(c.kind)) {
+                    if(c.runId && c.runId !== state.runId || c.fieldToken && c.fieldToken !== fieldToken)
+                        error = {code:'STALE_TASK',message:'受控任务或字段已变化'};
+                    else {writes.push({runId:state.runId,question,value:c.value || c.mode}); if(c.kind === 'draft') fieldToken += '-written';}
+                }
+                if(c.kind === 'writes') result = writes;
+                process.stdout.write(JSON.stringify({id,...(error?{error}:{result})})+'\n');
+            });
+        "#;
+        std::fs::write(
+            &script,
+            source.replace("INITIAL_STATE", &serde_json::to_string(&state).unwrap()),
+        )
+        .unwrap();
+        let host = BrowserHost::new(runtime, node(), script, Arc::new(|_| {}));
+        *host.active_run.lock().unwrap() = Some(run.id.clone());
+        *host.state.lock().unwrap() = state;
+        host
+    }
+    #[tokio::test]
+    async fn rejected_page_selection_cannot_send_fill_to_previous_page() {
+        let (dir, runtime, run) = fixture();
+        let host = boundary_host(runtime, dir.path(), &run);
+        let selected = host
+            .handle(
+                &run.dataset_id,
+                BrowserCommand::Select {
+                    target_id: "missing-target".into(),
+                    profile_version_id: run.profile_version_id.clone(),
+                    application_id: None,
+                    selection: None,
+                },
+            )
+            .await;
+        assert_eq!(selected.unwrap_err().code, "TARGET_GONE");
+        let filled = host
+            .handle(
+                &run.dataset_id,
+                BrowserCommand::Fill {
+                    mode: "full".into(),
+                },
+            )
+            .await;
+        let writes = host.call(json!({"kind":"writes"})).unwrap();
+        host.shutdown().unwrap();
+        assert!(filled.is_err(), "选页已失败，仍发送填写：{writes}");
+        assert_eq!(writes, json!([]));
+    }
+    #[tokio::test]
+    async fn missing_history_selection_cannot_leave_previous_page_authorized() {
+        let (dir, runtime, run) = fixture();
+        let host = boundary_host(runtime, dir.path(), &run);
+        assert!(
+            host.handle(
+                &run.dataset_id,
+                BrowserCommand::ResumeRun {
+                    run_id: id(),
+                    target_id: "new-target".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        let filled = host
+            .handle(
+                &run.dataset_id,
+                BrowserCommand::Fill {
+                    mode: "blank".into(),
+                },
+            )
+            .await;
+        let writes = host.call(json!({"kind":"writes"})).unwrap();
+        host.shutdown().unwrap();
+        assert!(filled.is_err(), "历史查询已失败却仍向旧页填写：{writes}");
+        assert_eq!(writes, json!([]));
+    }
+    #[tokio::test]
+    async fn missing_profile_or_failed_initial_save_revokes_the_previous_page() {
+        for failed_save in [false, true] {
+            let (dir, runtime, run) = fixture();
+            let host = boundary_host(runtime.clone(), dir.path(), &run);
+            if failed_save {
+                runtime
+                    .lock()
+                    .unwrap()
+                    .conn
+                    .execute_batch("PRAGMA query_only=ON")
+                    .unwrap();
+            }
+            let result = host
+                .handle(
+                    &run.dataset_id,
+                    BrowserCommand::Select {
+                        target_id: "new-target".into(),
+                        profile_version_id: if failed_save {
+                            run.profile_version_id.clone()
+                        } else {
+                            id()
+                        },
+                        application_id: None,
+                        selection: None,
+                    },
+                )
+                .await;
+            assert!(result.is_err());
+            runtime
+                .lock()
+                .unwrap()
+                .conn
+                .execute_batch("PRAGMA query_only=OFF")
+                .unwrap();
+            assert!(host.active_run.lock().unwrap().is_none());
+            assert!(
+                host.handle(
+                    &run.dataset_id,
+                    BrowserCommand::Fill {
+                        mode: "full".into()
+                    }
+                )
+                .await
+                .is_err()
+            );
+            // 同时验证辅助进程的旧 run 已撤销，不仅是本机隐藏 active_run。
+            assert_eq!(
+                host.call(json!({"kind":"fill","runId":run.id,"mode":"full"}))
+                    .unwrap_err()
+                    .code,
+                "STALE_TASK"
+            );
+            assert_eq!(host.call(json!({"kind":"writes"})).unwrap(), json!([]));
+            let store = runtime.lock().unwrap();
+            assert_eq!(
+                get::<FillRun>(&store.conn, "fill_runs", &run.id)
+                    .unwrap()
+                    .selection,
+                run.selection
+            );
+            drop(store);
+            host.shutdown().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn answer_confirmed_before_refresh_cannot_write_a_different_question() {
+        let (dir, runtime, run) = fixture();
+        let host = boundary_host(runtime, dir.path(), &run);
+        let inspected = host
+            .handle(&run.dataset_id, BrowserCommand::Inspect)
+            .await
+            .unwrap();
+        assert_eq!(inspected[0]["label"], "问题A");
+        host.call(json!({"kind":"navigate"})).unwrap();
+        let answered = host
+            .handle(
+                &run.dataset_id,
+                BrowserCommand::WriteAnswer {
+                    field_id: inspected[0]["id"].as_str().unwrap().into(),
+                    field_token: inspected[0]["fieldToken"].as_str().unwrap().into(),
+                    value: "只给问题A的合成回答".into(),
+                    confirmed: true,
+                },
+            )
+            .await;
+        let writes = host.call(json!({"kind":"writes"})).unwrap();
+        host.shutdown().unwrap();
+        assert!(answered.is_err(), "刷新后旧回答仍被写入：{writes}");
+        assert_eq!(writes, json!([]));
+    }
+    #[tokio::test]
+    async fn failed_history_selection_revokes_old_page_and_next_selection_still_works() {
+        let (dir, runtime, run) = fixture();
+        let host = boundary_host(runtime, dir.path(), &run);
+        let error = host
+            .handle(
+                &run.dataset_id,
+                BrowserCommand::ResumeRun {
+                    run_id: run.id.clone(),
+                    target_id: "missing-target".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "TARGET_GONE");
+        assert!(host.active_run.lock().unwrap().is_none());
+        assert!(
+            host.handle(
+                &run.dataset_id,
+                BrowserCommand::Fill {
+                    mode: "blank".into()
+                }
+            )
+            .await
+            .is_err()
+        );
+        // 断开后宿主可能仍有历史 run；引擎已撤销它不应阻止选择新页面。
+        *host.active_run.lock().unwrap() = Some(run.id.clone());
+        host.handle(
+            &run.dataset_id,
+            BrowserCommand::Select {
+                target_id: "new-target".into(),
+                profile_version_id: run.profile_version_id.clone(),
+                application_id: None,
+                selection: None,
+            },
+        )
+        .await
+        .unwrap();
+        let selected = host.current_run(&run.dataset_id).unwrap();
+        assert_ne!(selected.id, run.id);
+        assert_eq!(
+            host.state.lock().unwrap().target_id.as_deref(),
+            Some("new-target")
+        );
+        host.handle(
+            &run.dataset_id,
+            BrowserCommand::Fill {
+                mode: "blank".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.call(json!({"kind":"writes"})).unwrap(),
+            json!([
+                {"runId":selected.id,"question":"问题A","value":"blank"}
+            ])
+        );
+        host.shutdown().unwrap();
+    }
+    #[tokio::test]
+    async fn changed_question_is_rejected_before_model_and_fresh_answer_requires_confirmation() {
+        let (dir, runtime, run) = fixture();
+        let host = boundary_host(runtime.clone(), dir.path(), &run);
+        host.call(json!({"kind":"relabel"})).unwrap();
+        let error = host
+            .handle(
+                &run.dataset_id,
+                BrowserCommand::Draft {
+                    field_id: "f1".into(),
+                    field_token: "document-A-question-A".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "STALE_TASK");
+        assert!(
+            list::<ModelTask>(&runtime.lock().unwrap().conn, "tasks")
+                .unwrap()
+                .is_empty()
+        );
+        let field = &host
+            .handle(&run.dataset_id, BrowserCommand::Inspect)
+            .await
+            .unwrap()[0];
+        let answer = |confirmed| BrowserCommand::WriteAnswer {
+            field_id: field["id"].as_str().unwrap().into(),
+            field_token: field["fieldToken"].as_str().unwrap().into(),
+            value: "明确给问题B的合成回答".into(),
+            confirmed,
+        };
+        assert_eq!(
+            host.handle(&run.dataset_id, answer(false))
+                .await
+                .unwrap_err()
+                .code,
+            "CONFIRMATION_REQUIRED"
+        );
+        assert_eq!(host.call(json!({"kind":"writes"})).unwrap(), json!([]));
+        host.handle(&run.dataset_id, answer(true)).await.unwrap();
+        assert_eq!(
+            host.handle(&run.dataset_id, answer(true))
+                .await
+                .unwrap_err()
+                .code,
+            "STALE_TASK"
+        );
+        assert_eq!(
+            host.call(json!({"kind":"writes"})).unwrap(),
+            json!([
+                {"runId":run.id,"question":"问题B","value":"明确给问题B的合成回答"}
+            ])
+        );
+        host.shutdown().unwrap();
+    }
+    #[tokio::test]
+    async fn completed_draft_keeps_its_field_identity_until_applied() {
+        let (dir, runtime, run) = fixture();
+        let host = boundary_host(runtime.clone(), dir.path(), &run);
+        let task: ModelTask = serde_json::from_value(json!({
+            "id":id(),"contextId":format!("fill:{}",run.id),"generation":id(),"datasetId":run.dataset_id,
+            "purpose":"chat","provider":{"purpose":"chat","name":"离线合成","model":"fixture","endpoint":"http://127.0.0.1:1","version":id()},
+            "versions":[],"input":{"purpose":"chat","contextId":format!("fill:{}",run.id),"text":"合成输入","assetId":null,"stream":false,"versions":[]},
+            "status":"completed","progress":"已完成","content":"只给问题A的合成建议","usage":{},"error":null,"startedAt":now(),"updatedAt":now()
+        })).unwrap();
+        put(&runtime.lock().unwrap().conn, "tasks", &task.id, &task).unwrap();
+        host.drafts.lock().unwrap().insert(
+            task.id.clone(),
+            DraftTarget {
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                document_id: run.state.document_id.clone().unwrap(),
+                generation: run.state.generation.clone(),
+                field_id: "f1".into(),
+                field_token: "document-A-question-A".into(),
+            },
+        );
+        host.call(json!({"kind":"relabel"})).unwrap();
+        let apply = || BrowserCommand::ApplyDraft {
+            task_id: task.id.clone(),
+            confirmed: true,
+        };
+        assert_eq!(
+            host.handle(&run.dataset_id, apply())
+                .await
+                .unwrap_err()
+                .code,
+            "STALE_TASK"
+        );
+        assert_eq!(host.call(json!({"kind":"writes"})).unwrap(), json!([]));
+        assert_eq!(
+            get::<ModelTask>(&runtime.lock().unwrap().conn, "tasks", &task.id)
+                .unwrap()
+                .content,
+            task.content
+        );
+        // 另一份已核对当前题的合成建议，仍走同一正式应用入口；不调用模型。
+        host.drafts
+            .lock()
+            .unwrap()
+            .get_mut(&task.id)
+            .unwrap()
+            .field_token = "document-A-question-B".into();
+        let mut current = task.clone();
+        current.content = "明确给问题B的合成建议".into();
+        put(
+            &runtime.lock().unwrap().conn,
+            "tasks",
+            &current.id,
+            &current,
+        )
+        .unwrap();
+        host.handle(&run.dataset_id, apply()).await.unwrap();
+        assert_eq!(
+            host.call(json!({"kind":"writes"})).unwrap(),
+            json!([
+                {"runId":run.id,"question":"问题B","value":current.content}
+            ])
+        );
+        assert!(!host.drafts.lock().unwrap().contains_key(&task.id));
+        host.shutdown().unwrap();
     }
     #[test]
     fn panel_profile_switch_commits_only_for_the_selected_run_and_document() {
@@ -1236,6 +1676,7 @@ mod tests {
                 document_id: run.state.document_id.clone().unwrap(),
                 generation: run.state.generation.clone(),
                 field_id: "f1".into(),
+                field_token: "document-A-question-A".into(),
             },
         );
         let error = host

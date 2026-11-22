@@ -48,6 +48,7 @@ export interface BrowserStatus {
 }
 export interface BrowserField {
   id: string;
+  fieldToken: string;
   label: string;
   section: string;
   type: string;

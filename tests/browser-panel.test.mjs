@@ -92,8 +92,17 @@ async function setup(t) {
             fixture.connectionCalls++;
             return new Promise((resolve, reject) => { fixture.pending = { resolve, reject }; });
           }
-          if (fixture.fields && request.command.kind === "inspect") return fixture.fields;
+          if (fixture.fields && request.command.kind === "inspect") return structuredClone(fixture.fields);
           if (fixture.fields && request.command.kind === "upload") { fixture.uploads.push(request.command); return fixture.state; }
+          if (fixture.fields && request.command.kind === "write_answer") {
+            const field = fixture.fields.find((item) => item.id === request.command.fieldId);
+            if (!field || field.fieldToken !== request.command.fieldToken)
+              throw { code: "STALE_TASK", message: "所选问题或页面已变化，请重新核对字段。" };
+            fixture.writes.push({ ...request.command, question: field.label });
+            field.value = request.command.value;
+            field.fieldToken += "-written";
+            return fixture.state;
+          }
           if (["targets", "inspect"].includes(request.command.kind))
             throw { code: "FIXTURE_BUSINESS_ERROR", message: unrelatedFailure };
         }
@@ -224,4 +233,43 @@ test("配套附件替换只向明确的简历入口提供确认按钮", async (t
   assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.uploads), [
     { kind: "upload", fieldId: "resume", confirmed: true },
   ]);
+});
+
+test("开放题确认绑定检查到的问题，刷新失败保留回答并可重新检查后写入", async (t) => {
+  const { page, panel } = await setup(t);
+  await startConnect(page);
+  await finishConnect(page);
+  await page.evaluate(() => {
+    window.__browserPanelFixture.fields = [{ id: "f1", fieldToken: "document-A-question-A", label: "问题A", section: "开放题", type: "textarea", value: "", path: null,
+      options: [], required: false, disabled: false, touched: false }];
+    window.__browserPanelFixture.writes = [];
+  });
+  await panel.getByRole("button", { name: "核对字段／处理待办" }).click();
+  await panel.getByLabel("当前页面字段").selectOption("f1");
+  await panel.getByLabel("核对后的回答").fill("只给问题A的合成回答");
+  await panel.getByRole("button", { name: "确认回答并写入", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "确认回答后写入", exact: true });
+  await page.evaluate(() => {
+    const field = window.__browserPanelFixture.fields[0];
+    field.fieldToken = "document-B-question-B";
+    field.label = "问题B";
+  });
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "所选问题或页面已变化" }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.writes), []);
+  assert.equal(await panel.getByLabel("核对后的回答").inputValue(), "只给问题A的合成回答");
+  await capture(page, "stale-answer-preserved");
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await panel.getByRole("button", { name: "核对字段／处理待办" }).click();
+  await panel.getByLabel("当前页面字段").selectOption("f1");
+  await panel.getByLabel("核对后的回答").fill("明确给问题B的合成回答");
+  await panel.getByRole("button", { name: "确认回答并写入", exact: true }).click();
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.writes), [
+    { kind: "write_answer", fieldId: "f1", fieldToken: "document-B-question-B", value: "明确给问题B的合成回答", confirmed: true, question: "问题B" },
+  ]);
+  assert.equal(await panel.getByLabel("当前页面字段").inputValue(), "");
+  assert.equal(await panel.getByRole("button", { name: "确认回答并写入", exact: true }).count(), 0);
+  await capture(page, "fresh-answer-written");
 });

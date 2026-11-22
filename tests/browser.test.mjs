@@ -86,8 +86,8 @@ test("登录中断保留进度，验证码不能由草稿写入", async (t) => {
         '<label>验证码<input id="captcha"></label>',
       ),
     );
-  const field = (await connection.inspect()).find((f) => f.label === "验证码");
-  await connection.applyDraft(field.id, "123456");
+  const field = (await connection.inspect(true)).find((f) => f.label === "验证码");
+  await connection.applyDraft(field.id, "123456", field.fieldToken);
   assert.equal(await page.locator("#captcha").inputValue(), "");
   assert.ok(
     connection.state().results.some((x) => x.reason.includes("本人在网站处理")),
@@ -142,12 +142,12 @@ after(async () => {
   await browser?.close();
   await server?.close();
 });
-async function setup(t, selected = profile()) {
+async function setup(t, selected = profile(), route = "") {
   const context = await browser.newContext({
       viewport: { width: 1280, height: 900 },
     }),
     page = await context.newPage();
-  await page.goto(server.url);
+  await page.goto(server.url + route);
   const events = [],
     connection = new BrowserConnection((e) => events.push(e));
   connection.attach(browser);
@@ -171,6 +171,171 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("PR2 停止后按钮、草稿、草稿保存和继续均不能重新写，重选可另起任务", async (t) => {
+  const { page, connection } = await setup(t);
+  const field = (await connection.inspect(true)).find((f) => f.label === "为何选择此岗位");
+  const runId = connection.runId;
+  await panelClick(page, connection, "stop");
+  await until(() => connection.status === "stopped", "网页停止按钮应结束任务");
+  const capture = (operation) => operation.catch((error) => error.code);
+  await capture(connection.dispatch({ kind: "draft", runId, fieldId: field.id, fieldToken: field.fieldToken, value: "合成建议" }));
+  await capture(connection.dispatch({ kind: "advance", runId, saveDraft: true }));
+  await capture(connection.control("resume", runId));
+  await connection.job;
+  const actual = { draft: await page.locator("#answer").inputValue(), name: await page.locator("#name").inputValue(), saved: await page.evaluate(() => window.saved), status: connection.status };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { draft: "", name: "", saved: 0, status: "stopped" });
+  await panelClick(page, connection, "fill");
+  await connection.job;
+  assert.equal(await page.locator("#name").inputValue(), "");
+  const { id: targetId } = (await connection.listTargets()).find((target) => connection.targets.get(target.id) === page);
+  await connection.select({ targetId, runId: crypto.randomUUID(), profile: profile(), profiles: [], autoAdvance: false });
+  await connection.control("pause");
+  await connection.control("resume");
+  await connection.job;
+  assert.equal(await page.locator("#name").inputValue(), "合成甲");
+});
+
+test("PR2 同标签切换到另一岗位的片段路由后必须重选", async (t) => {
+  const { page, connection } = await setup(t, profile(), "/#/applications/job-a");
+  const previous = connection.generation;
+  await page.locator("form").evaluate((form) => form.insertAdjacentHTML("afterbegin", '<a href="#/applications/job-b">另一个岗位</a>'));
+  await page.getByRole("link", { name: "另一个岗位" }).click();
+  await until(() => connection.generation !== previous && (connection.context || connection.message.includes("离开")), "等待标签页切换岗位");
+  await fill(connection);
+  const actual = { route: new URL(page.url()).hash, mounted: !!connection.context, panel: await page.locator("#super-offer-controls").count(), name: await page.locator("#name").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { route: "#/applications/job-b", mounted: false, panel: 0, name: "" });
+});
+
+test("PR2 已确认的下一步允许同岗片段跨步，未跳转的按钮不授权以后访问别的岗位", async (t) => {
+  const { page, connection } = await setup(t, profile(), "/#/jobs/fixture/step/1");
+  await page.locator("#name").fill("本人输入");
+  await page.locator("#next").evaluate((old) => {
+    const next = old.cloneNode(true);
+    old.replaceWith(next);
+    next.onclick = () => { location.hash = "/jobs/fixture/step/2"; };
+  });
+  const firstDocument = connection.documentId;
+  const stepError = await connection.advance(false).then(() => null, (error) => error.code);
+  await until(() => connection.context && firstDocument !== connection.documentId, "同岗下一步应重新挂载");
+  await fill(connection);
+  const sameJob = await page.locator("#tail").inputValue();
+  const kept = await page.locator("#name").inputValue();
+  await page.locator("#next").evaluate((button) => {
+    button.onclick = () => {};
+    button.insertAdjacentHTML("afterend", '<a href="/other-job">查看别的岗位</a>');
+  });
+  await connection.advance(false);
+  const before = connection.generation;
+  await page.getByRole("link", { name: "查看别的岗位" }).click();
+  await until(() => connection.generation !== before && (connection.context || connection.message.includes("离开")), "等候新岗位");
+  await fill(connection);
+  const actual = { stepError, sameJob, kept, otherJob: await page.locator("#name").inputValue(), panels: await page.locator("#super-offer-controls").count(), submitted: await page.evaluate(() => window.submissions) };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { stepError: null, sameJob: profile().data.basic.github, kept: "本人输入", otherJob: "", panels: 0, submitted: 0 });
+});
+
+test("PR2 刷新重用字段编号或站点就地改题时拒绝旧草稿，重新检查后可写", async (t) => {
+  const { page, connection } = await setup(t);
+  const draft = (field, value) => connection.dispatch({ kind: "draft", runId: connection.runId, fieldId: field.id, fieldToken: field.fieldToken, value });
+  const question = async () => (await connection.inspect(true)).find((f) => f.type === "textarea");
+  const old = await question();
+  await page.reload();
+  await until(() => connection.context && connection.status === "paused", "刷新后重新挂载");
+  const fresh = await question();
+  assert.equal(old.id, fresh.id);
+  const refreshError = await draft(old, "刷新前的答案").then(() => null, (error) => error.code);
+  const refreshValue = await page.locator("#answer").inputValue();
+  const current = await question();
+  await page.locator("#answer").evaluate((el) => { el.parentElement.firstChild.textContent = "你如何验证项目"; });
+  const relabelError = await draft(current, "旧题答案").then(() => null, (error) => error.code);
+  const relabelValue = await page.locator("#answer").inputValue();
+  await draft(await question(), "当前题的合成答案");
+  const actual = { refreshError, refreshValue, relabelError, relabelValue, latest: await page.locator("#answer").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { refreshError: "STALE_TASK", refreshValue: "", relabelError: "STALE_TASK", relabelValue: "", latest: "当前题的合成答案" });
+});
+
+test("PR2 切到失效目标失败时撤销旧页写入权限", async (t) => {
+  const { page, connection } = await setup(t);
+  const runId = connection.runId, failedRun = crypto.randomUUID();
+  await assert.rejects(connection.select({ targetId: "已关闭的目标", runId: failedRun, profile: profile(), profiles: [] }));
+  await connection.dispatch({ kind: "fill", runId, mode: "full" }).catch(() => {});
+  await connection.job;
+  const actual = { active: !!connection.runId, mounted: !!connection.context, panel: await page.locator("#super-offer-controls").count(), name: await page.locator("#name").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { active: false, mounted: false, panel: 0, name: "" });
+  const state = await connection.dispatch({ kind: "unselect", runId: failedRun });
+  assert.equal(state.connected, true);
+  const target = (await connection.listTargets()).find((t) => connection.targets.get(t.id) === page);
+  await connection.select({ targetId: target.id, runId: crypto.randomUUID(), profile: profile(), profiles: [], autoAdvance: false });
+  await assert.rejects(connection.dispatch({ kind: "unselect", runId }), { code: "STALE_TASK" });
+  await fill(connection);
+  assert.equal(await page.locator("#name").inputValue(), "合成甲");
+});
+
+test("PR2 草稿确认到达后、实际写入前改题也不落入新字段", async (t) => {
+  const { page, connection } = await setup(t);
+  const answer = (await connection.inspect(true)).find((f) => f.type === "textarea");
+  const evaluate = connection.evaluate.bind(connection);
+  t.mock.method(connection, "evaluate", async (method, data) => {
+    if (method === "write") await page.locator("#answer").evaluate((el) => { el.parentElement.firstChild.textContent = "新的问题"; });
+    return evaluate(method, data);
+  });
+  const error = await connection.dispatch({ kind: "draft", runId: connection.runId, fieldId: answer.id, fieldToken: answer.fieldToken, value: "旧的合成回答" }).then(() => null, (e) => e.code);
+  const actual = { error, answer: await page.locator("#answer").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { error: "STALE_TASK", answer: "" });
+});
+
+test("PR2 停止后到达的最终页检查不能把已停止改回等待", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((el) => { el.innerHTML = '<label>姓名<input></label><button type="submit">最终投递</button>'; });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const evaluate = connection.evaluate.bind(connection);
+  t.mock.method(connection, "evaluate", async (method, data) => {
+    const result = await evaluate(method, data);
+    if (method === "action" && data.action === "next") { entered.resolve(); await release.promise; }
+    return result;
+  });
+  await connection.fill("full", true);
+  await entered.promise;
+  await connection.control("stop");
+  release.resolve();
+  await connection.job;
+  const actual = { status: connection.status, submitted: await page.evaluate(() => window.submissions) };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { status: "stopped", submitted: 0 });
+});
+
+test("PR2 下一步回执未返回时本人点击其他岗位，不继承自动跨页许可", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("#name").fill("本人输入");
+  await page.locator("#next").evaluate((old) => {
+    const button = old.cloneNode(true);
+    old.replaceWith(button);
+    button.insertAdjacentHTML("afterend", '<a href="/other-application">另一个岗位</a>');
+  });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const evaluate = connection.evaluate.bind(connection);
+  t.mock.method(connection, "evaluate", async (method, data) => {
+    const result = await evaluate(method, data);
+    if (method === "action" && data.action === "next") { entered.resolve(); await release.promise; }
+    return result;
+  });
+  const advance = connection.advance(false);
+  await entered.promise;
+  const original = connection.generation;
+  await page.getByRole("link", { name: "另一个岗位" }).click();
+  release.resolve();
+  await advance;
+  await until(() => connection.generation !== original && (connection.context || connection.message.includes("离开")), "等候跳转至其他岗位");
+  await fill(connection);
+  const actual = { mounted: !!connection.context, name: await page.locator("#name").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { mounted: false, name: "" });
+});
 async function panelNodes(connection) {
   const { root } = await connection.session.send("DOM.getDocument", { depth: -1, pierce: true });
   const nodes = [];
@@ -259,7 +424,10 @@ test("Formily国家区号和证件筛选框只读选中值，复合日期只读�
   await connection.job;
   assert.equal(await page.locator('[data-test="phone"] input[type="tel"]').inputValue(), "13900000000");
   assert.equal(await page.locator('[data-test="school"] input').first().inputValue(), "官网只读学校");
-  for (const field of filters) await connection.applyDraft(field.id, "不能写入的合成资料");
+  for (const item of filters) {
+    const field = (await connection.inspect(true)).find((f) => f.id === item.id);
+    await connection.applyDraft(field.id, "不能写入的合成资料", field.fieldToken);
+  }
   assert.deepEqual(await page.locator('.ud__select__selector__search__input').evaluateAll((elements) => elements.map((el) => el.value)), ["", ""]);
   assert.deepEqual(await page.locator('.ud__select__selector__selectItem').allTextContents(), ["+86", "居民身份证"]);
   assert.deepEqual(await page.locator('[data-test="date_range"] input').evaluateAll((elements) => elements.map((el) => el.value)), ["", ""]);
@@ -349,9 +517,9 @@ test("ATSX意向城市内部搜索不映射或写入，搜索词不算选择也�
   assert.equal(await page.evaluate(() => nextClicks), 0);
   assert.ok(connection.results.some((result) => result.status === "pending" && result.reason.includes("自定义选项")));
   await page.locator(".atsx-select-search__field").fill("杭州");
-  const searched = await connection.inspect();
+  const searched = await connection.inspect(true);
   assert.ok(searched.every((field) => field.value === "" && !field.valid && field.path === null));
-  await connection.applyDraft(fields.at(-1).id, "北京");
+  await connection.applyDraft(searched.at(-1).id, "北京", searched.at(-1).fieldToken);
   await connection.advance();
   await connection.fill("blank", true);
   await connection.job;
@@ -918,7 +1086,7 @@ test("明确登录路由的扫码视图不会自动下一步", async (t) => {
 
 test("检查后才出现的登录表单拦截旧字段草稿、下一步和附件", async (t) => {
   const { page, connection } = await setup(t);
-  const fields = await connection.inspect();
+  const fields = await connection.inspect(true);
   const phone = fields.find((x) => x.path === "basic.name");
   const file = fields.find((x) => x.type === "file");
   await page.locator("form").evaluate((form, html) => {
@@ -929,7 +1097,7 @@ test("检查后才出现的登录表单拦截旧字段草稿、下一步和附�
     window.loginActions = 0;
     for (const button of dialog.querySelectorAll("button")) button.onclick = () => window.loginActions++;
   }, smsLogin);
-  await connection.applyDraft(phone.id, "不能写入的合成草稿");
+  await connection.applyDraft(phone.id, "不能写入的合成草稿", phone.fieldToken);
   assert.equal(connection.status, "paused");
   assert.equal(await page.locator("#name").inputValue(), "");
   await connection.advance(false);
