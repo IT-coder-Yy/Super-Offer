@@ -171,6 +171,44 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("R18 DOM 无value及同值单选精确点击匹配项并核对真实checked节点", async (t) => {
+  const results = [];
+  for (const sameValue of [false, true]) {
+    const selected = profile(); selected.data.education = [];
+    const { page, connection } = await setup(t, selected);
+    await page.locator("form").evaluate((form, same) => {
+      const value = same ? ' value="same"' : "";
+      form.innerHTML = `<fieldset><legend>性别</legend><label>男<input id="male" name="gender" type="radio"${value}></label><label>女<input id="female" name="gender" type="radio"${value}></label></fieldset><button type="submit">最终提交申请</button>`;
+    }, sameValue);
+    const field = (await connection.inspect()).find((item) => item.type === "radio");
+    await fill(connection);
+    results.push({ sameValue, checked: await page.locator("input:checked").getAttribute("id"), status: connection.results.find((item) => item.fieldId === field.id).status });
+  }
+  t.diagnostic(JSON.stringify(results));
+  assert.deepEqual(results, [{ sameValue: false, checked: "female", status: "filled" }, { sameValue: true, checked: "female", status: "filled" }]);
+});
+test("R18 DOM 同值单选手改优先，歧义值和网站改选不得假报成功", async (t) => {
+  const selected = profile(); selected.data.education = [];
+  const { page, connection } = await setup(t, selected);
+  const reset = async () => page.locator("form").evaluate((form) => { form.innerHTML = '<fieldset><legend>性别</legend><label>男<input id="male" name="gender" type="radio"></label><label>女<input id="female" name="gender" type="radio"></label></fieldset><button type="submit">最终提交申请</button>'; });
+  await reset(); await fill(connection);
+  await page.locator("#male").check();
+  await fill(connection); await fill(connection, "blank");
+  assert.ok(await page.locator("#male").isChecked());
+  await reset();
+  const ambiguous = profile("歧义档案"); ambiguous.data.education=[]; ambiguous.data.basic.gender="on";
+  await connection.switchProfile(ambiguous, []); await fill(connection);
+  assert.equal(await page.locator("input:checked").count(), 0);
+  await reset();
+  await page.locator("#female").evaluate((el)=>el.addEventListener("click",()=>{document.querySelector("#male").checked=true;}));
+  await connection.switchProfile(selected, []);
+  const field=(await connection.inspect()).find((item)=>item.type==="radio");
+  await fill(connection);
+  assert.equal(await page.locator("input:checked").count(), 0);
+  assert.equal(connection.results.find((item)=>item.fieldId===field.id).status,"pending");
+  assert.equal(await page.evaluate(()=>window.submissions),0);
+});
+
 test("R18 主动断开保留同次填写的逐项快照，同时撤销原网页写权限", async (t) => {
   const { page, connection, events } = await setup(t);
   const before = await fill(connection);
@@ -196,6 +234,19 @@ test("R18 已有超长中英文和表情原文留在网页，清单有摘要，�
   t.diagnostic(JSON.stringify(actual));
   assert.ok(actual.lengths.every((size) => size > 0 && size <= 12000));
   assert.deepEqual({ ...actual, lengths: [] }, { preserved: true, lengths: [], summaries: [true, true], statuses: ["preserved", "preserved"], tail: profile().data.basic.github });
+});
+
+test("R18 上一项触发表单沿用同一控件改题，自动填写不把本人姓名写到联系人", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>性别<select><option value=""></option><option>女</option></select></label><label id="question"><span>姓名</span><input id="conditional"></label><label>GitHub<input id="tail"></label>';
+    form.querySelector("select").addEventListener("change", () => { form.querySelector("#question span").textContent = "紧急联系人姓名"; });
+  });
+  const { results } = await fill(connection);
+  const result = results.find((r) => r.label === "紧急联系人姓名");
+  const actual = { value: await page.locator("#conditional").inputValue(), status: result?.status, path: result?.path || null, tail: await page.locator("#tail").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { value: "", status: "pending", path: null, tail: profile().data.basic.github });
 });
 
 test("恢复历史清单保留旧版合法的长英文原文，新识别的页面值才取摘要", async (t) => {

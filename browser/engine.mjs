@@ -9,8 +9,8 @@ const stopped = () =>
   Object.assign(new Error("任务或页面已变化，请重新核对后继续。"), {
     code: "STALE_TASK",
   });
-const fieldIdentity = ({ id, label, section, type, entryId, entryIndex, autocomplete }) =>
-  ({ id, label, section, type, entryId, entryIndex, autocomplete });
+const fieldIdentity = ({ id, label, section, type, entryId, entryIndex, autocomplete, options }) =>
+  ({ id, label, section, type, entryId, entryIndex, autocomplete, options });
 const displayText = (text = "", limit = 12000) => {
   const suffix = "…（原文过长，仅显示部分）";
   const shown = text.length > limit ? text.slice(0, limit - suffix.length).toWellFormed() + suffix : text;
@@ -586,21 +586,26 @@ export class BrowserConnection {
       }
       const content = readValue(this.profile.data, field.path);
       if (!field.path) {
-        const result = await this.evaluate("mark", this.packet({ fieldId: field.id, reason: field.reason }));
+        const result = await this.evaluate("mark", this.packet({ fieldId: field.id, expected: fieldIdentity(field), reason: field.reason }));
         this.check(generation);
         if (result.status === "stale") throw stopped();
         if (this.pauseForLogin(result)) return;
-        this.record({ fieldId: field.id, label: field.label, ...result });
+        this.record({ fieldId: field.id, label: field.label, ...result, status: result.status === "stale-field" ? "pending" : result.status });
         await this.changed();
         continue;
       }
       const result = await this.evaluate(
         "write",
-        this.packet({ fieldId: field.id, value: content, mode }),
+        this.packet({ fieldId: field.id, expected: fieldIdentity(field), value: content, mode }),
       );
       this.check(generation);
       if (result.status === "stale") throw stopped();
       if (this.pauseForLogin(result)) return;
+      if (result.status === "stale-field") {
+        this.record({ fieldId: field.id, ...result, status: "pending" });
+        await this.changed();
+        continue;
+      }
       const readback = await this.evaluate("fieldState", field.id);
       this.check(generation);
       if (
@@ -754,7 +759,7 @@ export class BrowserConnection {
       this.packet({ fieldId, expected: fieldIdentity(field), value: content, mode: this.mode || "full" }),
     );
     this.check(generation);
-    if (result.status === "stale") {
+    if (["stale", "stale-field"].includes(result.status)) {
       this.status = "paused";
       this.message = "题目已变化，请重新检查后确认写入";
       await this.changed();
