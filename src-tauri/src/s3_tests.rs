@@ -1474,6 +1474,178 @@ path = libs/last
     );
 }
 
+#[test]
+fn pr19_continued_submodules_keep_missing_paths_in_directory_and_zip() {
+    let valid = r#"[submodule "before"]
+path = libs/before
+[submodule "plugins/[ui]"]
+path = plugins/[ui]
+[submodule "unquoted"]
+path = libs/long-\
+module
+[submodule "quoted"]
+path = "libs/quo\
+ted"
+[submodule "indented"]
+path = libs/\
+  indented
+[submodule "split-quotes"]
+path = "libs/with "\
+ "space"
+[submodule "escaped\"quote]and\\slash"]
+path = "libs/quoted\"\
+name"
+[submodule "comment"]
+path = libs/comment # ignored \
+[submodule "quoted-comment"]
+path = "libs/with #;"\
+"marks" ; ignored \
+[submodule "leading"]
+path = \
+  libs/leading
+[submodule "repeated"]
+path = libs/\
+\
+last
+[submodule "present"]
+path = libs/pre\
+sent
+[submodule "other-variable"]
+url = do-not-fetch\
+path = libs/not-a-declaration
+path = libs/real
+[other]
+value = ignored\
+[submodule "not-a-section"]
+path = libs/also-not-a-declaration
+[submodule "last"]
+path = libs/end\
+"#;
+    let mut valid_missing = vec![
+        "libs/  indented/",
+        "libs/before/",
+        "libs/comment/",
+        "libs/end/",
+        "libs/last/",
+        "libs/leading/",
+        "libs/long-module/",
+        "libs/quoted/",
+        "libs/quoted\"name/",
+        "libs/real/",
+        "libs/with  space/",
+        "libs/with #;marks/",
+        "plugins/[ui]/",
+    ];
+    valid_missing.sort_unstable();
+    let mixed = concat!(
+        "[submodule \"before\"]\npath = libs/before\n",
+        "[submodule \"unsafe\"]\npath = ../\\\noutside\n",
+        "[submodule \"bad-escape\"]\npath = libs/bad\\q\n",
+        "[submodule \"backslash-space\"]\npath = libs/trailing\\ \n",
+        "[submodule \"escaped-backslash\"]\npath = libs/back\\\\\n",
+        "[submodule \"quoted-newline\"]\npath = \"libs/invalid\nnewline\"\n",
+        "[submodule \"missing-path\"]\nurl = do-not-fetch\n",
+        "[submodule \"unterminated]\npath = libs/do-not-guess\n",
+        "[submodule \"after]bad\"]\npath = libs/af\\\nter\n",
+        "[submodule \"valid-last\"]\npath = libs/last\n",
+    );
+    let cases = [
+        ("LF", valid.to_owned(), valid_missing.clone(), false),
+        (
+            "CRLF",
+            valid.replace('\n', "\r\n"),
+            valid_missing.clone(),
+            false,
+        ),
+        (
+            "EOF",
+            valid.trim_end_matches('\n').to_owned(),
+            valid_missing,
+            false,
+        ),
+        (
+            "mixed",
+            mixed.to_owned(),
+            vec!["libs/after/", "libs/before/", "libs/last/"],
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, declarations, expected, incomplete) in cases {
+        for directory in [true, false] {
+            let (root, runtime, dataset) = fixture();
+            let project = root.path().join("project");
+            fs::create_dir_all(project.join("libs/present")).unwrap();
+            fs::write(project.join(".gitmodules"), &declarations).unwrap();
+            fs::write(
+                project.join("libs/present/main.rs"),
+                b"fn do_not_execute() {}\n",
+            )
+            .unwrap();
+            let path = if directory {
+                project
+            } else {
+                let path = root.path().join("project.zip");
+                zip_file(
+                    &path,
+                    &[
+                        (".gitmodules", declarations.as_bytes()),
+                        ("libs/present/main.rs", b"fn do_not_execute() {}\n"),
+                    ],
+                );
+                path
+            };
+            let original_path = if directory {
+                path.join(".gitmodules")
+            } else {
+                path.clone()
+            };
+            let original = fs::read(&original_path).unwrap();
+            let host = Arc::new(SourceHost::new());
+            let selection = host.select(&dataset, path, directory).unwrap();
+            let version: SourceVersion = serde_json::from_value(
+                host.handle(
+                    &runtime,
+                    &dataset,
+                    SourceCommand::Import {
+                        token: selection.token,
+                        project_id: None,
+                        name: "只读续行声明样本".into(),
+                        operation_id: id(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let files = source::files_for(&runtime.lock().unwrap().conn, &version.id).unwrap();
+            let missing = files
+                .iter()
+                .filter(|f| f.status == "failed" && f.reason.contains("声明的子模块"))
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>();
+            let failed_declaration = files
+                .iter()
+                .any(|f| f.path == ".gitmodules" && f.status == "failed");
+            if missing != expected || failed_declaration != incomplete {
+                failures.push(format!("{case}, directory={directory}: missing={missing:?}, incomplete={failed_declaration}"));
+            }
+            assert!(
+                files
+                    .iter()
+                    .any(|f| f.path == "libs/present/main.rs" && f.status == "readable")
+            );
+            assert!(
+                files
+                    .iter()
+                    .any(|f| f.path == ".gitmodules" && f.status == "readable")
+            );
+            assert_eq!(fs::read(&original_path).unwrap(), original);
+            crate::backup::export(&runtime.lock().unwrap(), true, true).unwrap();
+        }
+    }
+    assert!(failures.is_empty(), "续行声明清单不符：{failures:#?}");
+}
+
 #[tokio::test]
 async fn confirmed_resume_text_is_opt_in_frozen_to_old_profile_and_survives_backup() {
     let server = Server::new(

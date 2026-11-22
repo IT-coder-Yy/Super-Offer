@@ -697,8 +697,9 @@ fn submodule_paths(text: &str) -> (Vec<String>, bool) {
     let mut incomplete = false;
     let mut in_module = false;
     let mut has_path = false;
-    for line in text.lines() {
-        let mut line = line.trim();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let mut line = line.trim_start();
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
         }
@@ -731,32 +732,32 @@ fn submodule_paths(text: &str) -> (Vec<String>, bool) {
             in_module = section.starts_with("submodule ")
                 || section.starts_with("submodule\t")
                 || section.starts_with("submodule.");
-            line = tail.trim();
+            line = tail.trim_start();
             if line.is_empty() || line.starts_with(['#', ';']) {
                 continue;
             }
         }
-        if !in_module {
-            continue;
-        }
         let Some((key, raw)) = line.split_once('=') else {
-            if line
-                .split_whitespace()
-                .next()
-                .is_some_and(|key| key.eq_ignore_ascii_case("path"))
+            if in_module
+                && line
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|key| key.eq_ignore_ascii_case("path"))
             {
                 incomplete = true;
             }
             continue;
         };
-        if !key.trim().eq_ignore_ascii_case("path") {
+        // Consume other values too: their continuation is not a new declaration.
+        let value = submodule_path_value(raw, &mut lines);
+        if !in_module || !key.trim().eq_ignore_ascii_case("path") {
             continue;
         }
         if has_path || paths.len() >= MAX_FILES {
             incomplete = true;
             continue;
         }
-        match submodule_path_value(raw) {
+        match value {
             Ok(value) => paths.push(value),
             Err(()) => incomplete = true,
         }
@@ -768,41 +769,59 @@ fn submodule_paths(text: &str) -> (Vec<String>, bool) {
     (paths, incomplete)
 }
 
-fn submodule_path_value(raw: &str) -> std::result::Result<String, ()> {
+fn submodule_path_value<'a>(
+    mut raw: &'a str,
+    lines: &mut std::str::Lines<'a>,
+) -> std::result::Result<String, ()> {
     let mut value = String::new();
     let mut quoted = false;
     let mut escaped = false;
     let mut value_end = 0;
-    for character in raw.trim().chars() {
-        if escaped {
-            value.push(match character {
-                '\\' | '"' => character,
-                'n' => '\n',
-                't' => '\t',
-                'b' => '\u{8}',
-                _ => return Err(()),
-            });
-            value_end = value.len();
-            escaped = false;
-        } else {
-            match character {
-                '\\' => escaped = true,
-                '"' => {
-                    quoted = !quoted;
-                    value_end = value.len();
-                }
-                '#' | ';' if !quoted => break,
-                _ => {
-                    value.push(character);
-                    if quoted || !character.is_whitespace() {
+    let mut started = false;
+    'value: loop {
+        for character in raw.chars() {
+            if escaped {
+                value.push(match character {
+                    '\\' | '"' => character,
+                    'n' => '\n',
+                    't' => '\t',
+                    'b' => '\u{8}',
+                    _ => return Err(()),
+                });
+                value_end = value.len();
+                started = true;
+                escaped = false;
+            } else {
+                match character {
+                    '\\' => escaped = true,
+                    '"' => {
+                        quoted = !quoted;
+                        started = true;
                         value_end = value.len();
+                    }
+                    '#' | ';' if !quoted => break 'value,
+                    _ => {
+                        if !started && character.is_whitespace() {
+                            continue;
+                        }
+                        started = true;
+                        value.push(character);
+                        if quoted || !character.is_whitespace() {
+                            value_end = value.len();
+                        }
                     }
                 }
             }
         }
+        if !escaped {
+            break;
+        }
+        escaped = false;
+        let Some(next) = lines.next() else { break };
+        raw = next;
     }
     value.truncate(value_end);
-    if quoted || escaped || !safe_relative(&value) || value.ends_with('/') {
+    if quoted || !safe_relative(&value) || value.ends_with('/') {
         return Err(());
     }
     Ok(value)
