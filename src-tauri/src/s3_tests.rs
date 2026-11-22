@@ -506,13 +506,12 @@ fn zip_file(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     zip.finish().unwrap();
 }
 #[test]
-fn zip_rejects_escape_case_collisions_damage_and_stale_selection() {
+fn zip_rejects_escape_damage_and_stale_selection() {
     for entries in [
         vec![
             ("../outside.txt", &b"outside"[..]),
             ("src/main.rs", &b"fn main() {}"[..]),
         ],
-        vec![("SRC/a.rs", &b"a"[..]), ("src/A.rs", &b"b"[..])],
         vec![("C:/secret", &b"outside"[..])],
     ] {
         let (root, runtime, dataset) = fixture();

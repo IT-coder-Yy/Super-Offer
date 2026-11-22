@@ -301,6 +301,9 @@ pub fn prepare_path(store: &Store, path: &Path) -> Result<Prepared> {
 }
 fn prepare_reader(store: &Store, reader: impl Read + Seek) -> Result<Prepared> {
     let mut archive = zip::ZipArchive::new(reader)?;
+    if archive.has_duplicate_names() {
+        return Err(AppError::invalid("备份含有重复条目。"));
+    }
     if archive.len() > 10_002 {
         return Err(AppError::invalid("备份条目超过限制。"));
     }

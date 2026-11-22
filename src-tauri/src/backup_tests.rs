@@ -693,3 +693,387 @@ fn future_backup_manifest_is_rejected_without_changing_current_workspace() {
     assert_eq!(dataset_hashes(&store.dir()), before);
     assert_eq!(fs::read(root.path().join("active")).unwrap(), active);
 }
+
+fn pr2_import(runtime: &Arc<Runtime>, path: &Path, directory: bool) -> SourceVersion {
+    let dataset = runtime.lock().unwrap().dataset_id.clone();
+    let host = Arc::new(SourceHost::new());
+    let selected = host
+        .select(&dataset, path.to_path_buf(), directory)
+        .unwrap();
+    serde_json::from_value(
+        host.handle(
+            runtime,
+            &dataset,
+            SourceCommand::Import {
+                token: selected.token,
+                project_id: None,
+                name: "PR2 合成只读项目".into(),
+                operation_id: id(),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn pr2_case_distinct_directory_files_can_be_backed_up_and_restored() {
+    let original = tempfile::tempdir().unwrap();
+    // Some volumes fold these names together; probe without overwriting either original.
+    let names = ["\u{0130}.rs", "i\u{0307}.rs"];
+    for (index, (name, content)) in names
+        .iter()
+        .zip(["const UPPER: u8 = 1;", "const LOWER: u8 = 2;"])
+        .enumerate()
+    {
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(original.path().join(name))
+        {
+            Ok(file) => file,
+            Err(error) if index == 1 && error.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!(
+                    "PR2 case: skipped directory sample: this volume cannot represent both names; ZIP roundtrip remains covered separately"
+                );
+                return;
+            }
+            Err(error) => panic!("cannot create case-distinct fixture: {error}"),
+        };
+        file.write_all(content.as_bytes()).unwrap();
+    }
+    assert_eq!(fs::read_dir(original.path()).unwrap().count(), 2);
+    assert_ne!(
+        fs::read(original.path().join(names[0])).unwrap(),
+        fs::read(original.path().join(names[1])).unwrap()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(
+        Store::open(root.path()).unwrap(),
+        Arc::new(NoVault),
+        Arc::new(|_| {}),
+    );
+    let version = pr2_import(&runtime, original.path(), true);
+    let store = runtime.lock().unwrap();
+    assert_eq!(version.readable_files, 2);
+    eprintln!("PR2 case: directory imported two distinct readable source paths");
+    let receipt = backup::export(&store, true, true).unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let mut restored = Store::open(destination.path()).unwrap();
+    let prepared = backup::prepare_path(&restored, Path::new(&receipt.path)).unwrap();
+    let token = prepared.preview.token.clone();
+    backup::commit(&mut restored, prepared, &token, true, false).unwrap();
+    let files = crate::source::files_for(&restored.conn, &version.id).unwrap();
+    assert_eq!(files.len(), 2);
+    let asset: FileAsset = get(&restored.conn, "assets", &version.asset_id).unwrap();
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(restored.read_asset(&asset.id).unwrap().1)).unwrap();
+    for name in names {
+        let mut content = Vec::new();
+        archive
+            .by_name(name)
+            .unwrap()
+            .read_to_end(&mut content)
+            .unwrap();
+        assert_eq!(content, fs::read(original.path().join(name)).unwrap());
+    }
+}
+
+#[test]
+fn pr2_missing_submodule_is_reported_for_directory_and_zip() {
+    let mut missing = Vec::new();
+    for directory in [true, false] {
+        let original = tempfile::tempdir().unwrap();
+        let declarations = "[submodule \"missing\"]\n path = deps/missing\n url = https://example.invalid/missing.git\n";
+        let selected = if directory {
+            fs::write(original.path().join(".gitmodules"), declarations).unwrap();
+            fs::write(original.path().join("main.rs"), "fn main() {}\n").unwrap();
+            original.path().to_path_buf()
+        } else {
+            let path = original.path().join("source.zip");
+            let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            for (name, text) in [(".gitmodules", declarations), ("main.rs", "fn main() {}\n")] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(text.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+            path
+        };
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(
+            Store::open(root.path()).unwrap(),
+            Arc::new(NoVault),
+            Arc::new(|_| {}),
+        );
+        let version = pr2_import(&runtime, &selected, directory);
+        let store = runtime.lock().unwrap();
+        let files = crate::source::files_for(&store.conn, &version.id).unwrap();
+        eprintln!(
+            "PR2 submodule: directory={directory}, readable={}, gaps={}",
+            version.readable_files,
+            files
+                .iter()
+                .filter(|file| file.status != "readable")
+                .count()
+        );
+        if !files.iter().any(|file| {
+            file.path == "deps/missing/"
+                && file.status == "failed"
+                && file.reason.contains("子模块")
+        }) {
+            missing.push(directory);
+        }
+        backup::export(&store, true, true).unwrap();
+    }
+    assert!(
+        missing.is_empty(),
+        "缺失子模块清单缺口，directory={missing:?}"
+    );
+}
+
+#[test]
+fn pr2_case_distinct_zip_paths_are_kept_as_archive_paths() {
+    let original = tempfile::tempdir().unwrap();
+    let path = original.path().join("case.zip");
+    let entries = [
+        ("Readme.rs", "const FIRST: u8 = 1;"),
+        ("readme.rs", "const SECOND: u8 = 2;"),
+        ("Src/task.rs", "const UPPER_DIR: u8 = 3;"),
+        ("src/task.rs", "const LOWER_DIR: u8 = 4;"),
+        ("\u{0130}.rs", "const UNICODE_UPPER: u8 = 5;"),
+        ("i\u{0307}.rs", "const UNICODE_LOWER: u8 = 6;"),
+    ];
+    let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    for (name, content) in entries {
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap();
+    let original_hash = digest(&fs::read(&path).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(
+        Store::open(root.path()).unwrap(),
+        Arc::new(NoVault),
+        Arc::new(|_| {}),
+    );
+    let version = pr2_import(&runtime, &path, false);
+    assert_eq!(version.readable_files, entries.len());
+    let store = runtime.lock().unwrap();
+    let receipt = backup::export(&store, true, true).unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let mut restored = Store::open(destination.path()).unwrap();
+    let prepared = backup::prepare_path(&restored, Path::new(&receipt.path)).unwrap();
+    let token = prepared.preview.token.clone();
+    backup::commit(&mut restored, prepared, &token, true, false).unwrap();
+    assert_eq!(
+        crate::source::files_for(&restored.conn, &version.id)
+            .unwrap()
+            .len(),
+        entries.len()
+    );
+    let mut archive = zip::ZipArchive::new(Cursor::new(
+        restored.read_asset(&version.asset_id).unwrap().1,
+    ))
+    .unwrap();
+    for (name, content) in entries {
+        let mut saved = String::new();
+        archive
+            .by_name(name)
+            .unwrap()
+            .read_to_string(&mut saved)
+            .unwrap();
+        assert_eq!(saved, content);
+    }
+    assert_eq!(digest(&fs::read(&path).unwrap()), original_hash);
+}
+
+#[test]
+fn pr2_submodule_coverage_checks_real_path_boundaries_without_executing_or_fetching() {
+    for directory in [true, false] {
+        let original = tempfile::tempdir().unwrap();
+        let entries = [
+            (
+                "bundle/.gitmodules",
+                "[submodule \"existing\"]\n path = libs/present\n fetchRecurseSubmodules\n[submodule \"quoted\"]\n path = \"libs/with space\" # comment\n[submodule \"absent\"]\n path = libs/absent\n[submodule \"empty\"]\n path = libs/empty\n[submodule \"excluded\"]\n path = vendor/excluded\n",
+            ),
+            ("bundle/main.rs", "fn synthetic_only() {}\n"),
+            ("bundle/libs/present/main.rs", "fn present() {}\n"),
+            ("bundle/libs/with space/main.rs", "fn quoted() {}\n"),
+            (
+                "bundle/libs/absent-neighbour/main.rs",
+                "fn not_the_submodule() {}\n",
+            ),
+            ("bundle/vendor/excluded/main.rs", "fn excluded() {}\n"),
+            (
+                "bundle/libs/present/.gitmodules",
+                "[submodule \"nested-missing\"]\n path = nested\n",
+            ),
+            (
+                "malformed/.gitmodules",
+                "[submodule \"escape\"]\n path = ../../outside\n",
+            ),
+        ];
+        let path = if directory {
+            for (name, content) in entries {
+                let path = original.path().join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, content).unwrap();
+            }
+            fs::create_dir_all(original.path().join("bundle/libs/empty")).unwrap();
+            original.path().to_path_buf()
+        } else {
+            let path = original.path().join("project.zip");
+            let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            for (name, content) in entries {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(content.as_bytes()).unwrap();
+            }
+            writer
+                .add_directory(
+                    "bundle/libs/empty/",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.finish().unwrap();
+            path
+        };
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(
+            Store::open(root.path()).unwrap(),
+            Arc::new(NoVault),
+            Arc::new(|_| {}),
+        );
+        let version = pr2_import(&runtime, &path, directory);
+        let store = runtime.lock().unwrap();
+        let files = crate::source::files_for(&store.conn, &version.id).unwrap();
+        let missing = files
+            .iter()
+            .filter(|file| file.status == "failed" && file.reason.contains("声明的子模块"))
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing,
+            [
+                "bundle/libs/absent/",
+                "bundle/libs/empty/",
+                "bundle/libs/present/nested/",
+                "bundle/vendor/excluded/"
+            ],
+            "directory={directory}"
+        );
+        assert!(files.iter().any(|file| file.path == "malformed/.gitmodules"
+            && file.status == "failed"
+            && file.reason.contains("子模块声明无法完整核对")));
+        assert!(!files.iter().any(|file| file.path.contains("../")));
+        assert_eq!(version.total_files, files.len());
+        backup::export(&store, true, true).unwrap();
+    }
+}
+
+#[test]
+fn pr2_source_archive_still_rejects_exact_duplicates_and_traversal() {
+    for (names, duplicate) in [
+        (["sameA.rs", "sameB.rs"], true),
+        (["../outside.rs", "safe.rs"], false),
+        (["/absolute.rs", "safe.rs"], false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for name in names {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"fn synthetic() {}\n").unwrap();
+        }
+        let mut bytes = writer.finish().unwrap().into_inner();
+        if duplicate {
+            for index in 0..bytes.len() - 8 {
+                if &bytes[index..index + 8] == b"sameB.rs" {
+                    bytes[index + 4] = b'A';
+                }
+            }
+        }
+        let path = root.path().join("bad.zip");
+        fs::write(&path, bytes).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(
+            Store::open(data.path()).unwrap(),
+            Arc::new(NoVault),
+            Arc::new(|_| {}),
+        );
+        let dataset = runtime.lock().unwrap().dataset_id.clone();
+        let host = Arc::new(SourceHost::new());
+        let selection = host.select(&dataset, path, false).unwrap();
+        assert!(
+            host.handle(
+                &runtime,
+                &dataset,
+                SourceCommand::Import {
+                    token: selection.token,
+                    project_id: None,
+                    name: "拒绝坏包".into(),
+                    operation_id: id()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            list::<SourceVersion>(&runtime.lock().unwrap().conn, "source_versions")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn pr2_portable_backup_rejects_identical_duplicate_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    add_profile(&mut store, "完全同名条目合成测试");
+    let receipt = backup::export(&store, true, true).unwrap();
+    let mut archive = zip::ZipArchive::new(fs::File::open(&receipt.path).unwrap()).unwrap();
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut manifest = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let name = entry.name().unwrap().into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        if name == "manifest.json" {
+            manifest = bytes.clone();
+        }
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    writer
+        .start_file("duplicate.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(&manifest).unwrap();
+    let mut bytes = writer.finish().unwrap().into_inner();
+    for index in 0..bytes.len() - 13 {
+        if &bytes[index..index + 13] == b"duplicate.txt" {
+            bytes[index..index + 13].copy_from_slice(b"manifest.json");
+        }
+    }
+    assert!(
+        zip::ZipArchive::new(Cursor::new(&bytes))
+            .unwrap()
+            .has_duplicate_names()
+    );
+    let active = fs::read(root.path().join("active")).unwrap();
+    let before = dataset_hashes(&store.dir());
+    assert!(
+        backup::prepare(&store, &bytes).is_err(),
+        "整库包不能接受被库内部折叠的完全同名条目"
+    );
+    assert_eq!(fs::read(root.path().join("active")).unwrap(), active);
+    assert_eq!(dataset_hashes(&store.dir()), before);
+}

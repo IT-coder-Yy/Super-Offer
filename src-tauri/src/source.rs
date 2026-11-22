@@ -691,6 +691,98 @@ pub fn has_secret(text: &str) -> bool {
     })
 }
 
+// Read declarations only. Never run Git, follow a declaration as a path, or fetch its URL.
+fn submodule_paths(text: &str) -> std::result::Result<Vec<String>, ()> {
+    let mut paths = Vec::new();
+    let mut in_module = false;
+    let mut has_path = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') {
+            if in_module && !has_path {
+                return Err(());
+            }
+            let (section, tail) = line.strip_prefix('[').unwrap().split_once(']').ok_or(())?;
+            if !tail.trim().is_empty() && !tail.trim().starts_with(['#', ';']) {
+                return Err(());
+            }
+            let section = section.trim().to_ascii_lowercase();
+            in_module = section.starts_with("submodule ")
+                || section.starts_with("submodule\t")
+                || section.starts_with("submodule.");
+            has_path = false;
+            continue;
+        }
+        if !in_module {
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            if line
+                .split_whitespace()
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("path"))
+            {
+                return Err(());
+            }
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("path") {
+            continue;
+        }
+        if has_path || paths.len() >= MAX_FILES {
+            return Err(());
+        }
+        let mut value = String::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut value_end = 0;
+        for character in raw.trim().chars() {
+            if escaped {
+                value.push(match character {
+                    '\\' | '"' => character,
+                    'n' => '\n',
+                    't' => '\t',
+                    'b' => '\u{8}',
+                    _ => return Err(()),
+                });
+                value_end = value.len();
+                escaped = false;
+            } else {
+                match character {
+                    '\\' => escaped = true,
+                    '"' => {
+                        quoted = !quoted;
+                        value_end = value.len();
+                    }
+                    '#' | ';' if !quoted => break,
+                    _ => {
+                        value.push(character);
+                        if quoted || !character.is_whitespace() {
+                            value_end = value.len();
+                        }
+                    }
+                }
+            }
+        }
+        if quoted || escaped {
+            return Err(());
+        }
+        value.truncate(value_end);
+        if !safe_relative(&value) || value.ends_with('/') {
+            return Err(());
+        }
+        paths.push(value);
+        has_path = true;
+    }
+    if in_module && !has_path {
+        return Err(());
+    }
+    Ok(paths)
+}
+
 struct PreparedSource {
     archive: tempfile::NamedTempFile,
     files: Vec<SourceFile>,
@@ -702,6 +794,7 @@ struct Collector {
     bytes: u64,
     version_id: String,
     visited: usize,
+    submodules: HashSet<String>,
 }
 impl Collector {
     fn new() -> Result<Self> {
@@ -711,6 +804,7 @@ impl Collector {
             bytes: 0,
             version_id: id(),
             visited: 0,
+            submodules: HashSet::new(),
         })
     }
     fn record(
@@ -817,14 +911,68 @@ impl Collector {
             digest(&bytes),
             content.lines().count().max(1),
         );
+        if path.rsplit('/').next() == Some(".gitmodules") {
+            let parent = path.strip_suffix(".gitmodules").unwrap();
+            let parsed = submodule_paths(&content);
+            let mut truncated = false;
+            if let Ok(paths) = &parsed {
+                for module in paths {
+                    let path = format!("{parent}{module}/");
+                    if self.submodules.len() >= MAX_FILES && !self.submodules.contains(&path) {
+                        truncated = true;
+                        break;
+                    }
+                    self.submodules.insert(path);
+                }
+            }
+            if parsed.is_err() || truncated {
+                self.record(
+                    path,
+                    "failed",
+                    "子模块声明无法完整核对，可能含不安全路径或超出数量限制；未执行或下载。",
+                    0,
+                    String::new(),
+                    0,
+                );
+            }
+        }
         Ok(())
     }
-    fn finish(self) -> Result<PreparedSource> {
+    fn finish(mut self) -> Result<PreparedSource> {
         if !self.files.iter().any(|f| f.status == "readable") {
             return Err(AppError::new(
                 "SOURCE_EMPTY",
                 "没有可读取的源码材料；请检查空项目、权限、文件类型和排除规则。",
             ));
+        }
+        let mut readable_paths = self
+            .files
+            .iter()
+            .filter(|file| file.status == "readable")
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        readable_paths.sort_unstable();
+        let mut missing = self
+            .submodules
+            .iter()
+            .filter(|prefix| {
+                let index = readable_paths.partition_point(|path| *path < prefix.as_str());
+                !readable_paths
+                    .get(index)
+                    .is_some_and(|path| path.starts_with(prefix.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        for path in missing {
+            self.record(
+                &path,
+                "failed",
+                "声明的子模块未导入可读文件：可能缺失、未初始化或被排除；未执行或下载。",
+                0,
+                String::new(),
+                0,
+            );
         }
         let mut archive = self.writer.finish()?;
         archive.as_file_mut().sync_all()?;
@@ -842,16 +990,17 @@ fn read_zip(file: fs::File, cancelled: &AtomicBool) -> Result<PreparedSource> {
         ));
     }
     let mut zip = zip::ZipArchive::new(file)?;
+    if zip.has_duplicate_names() {
+        return Err(AppError::invalid("ZIP含重复条目，未导入。"));
+    }
     let mut output = Collector::new()?;
     let mut names = HashSet::new();
     for i in 0..zip.len().min(MAX_FILES) {
         check_cancel(cancelled)?;
         let file = zip.by_index(i)?;
         let name = file.name()?.into_owned();
-        if !safe_relative(&name) || !names.insert(name.to_lowercase()) {
-            return Err(AppError::invalid(
-                "ZIP含路径越界、非法或大小写重复条目，未导入。",
-            ));
+        if !safe_relative(&name) || !names.insert(name.clone()) {
+            return Err(AppError::invalid("ZIP含路径越界、非法或重复条目，未导入。"));
         }
         if file.is_symlink() || file.encrypted() {
             output.record(
@@ -1198,7 +1347,7 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
                 || !["readable", "excluded", "failed"].contains(&file.status.as_str())
                 || (file.status == "readable"
                     && (!safe_relative(&file.path)
-                        || !paths.insert(file.path.to_lowercase())
+                        || !paths.insert(file.path.clone())
                         || file.sha256.len() != 64
                         || file.lines == 0))
             {
