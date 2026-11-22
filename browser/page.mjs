@@ -5,7 +5,8 @@ export function installWorld(binding, documentId) {
   const elements = new Map(),
     ids = new WeakMap(),
     owned = new WeakMap(),
-    touched = new WeakSet();
+    touched = new WeakSet(),
+    uploadStates = new WeakMap();
   let sequence = 0,
     view = { generation: "", status: "ready", profileName: "", profiles: [] },
     writing = false,
@@ -360,6 +361,21 @@ export function installWorld(binding, documentId) {
     return visible(link) && !/模板|示例|template|sample/i.test(reference) && (link.hasAttribute("download") ||
       /\.(?:pdf|docx?)(?:$|[?#\s])/i.test(reference) || /(?:查看|下载|预览)(?:已上传的?|我的)?简历|(?:view|download|preview)\s+(?:your\s+)?(?:resume|cv)\b/i.test(title));
   });
+  const uploadState = (el) => {
+    const scope = uploadScope(el);
+    const signature = JSON.stringify({
+      accept: el.accept, label: label(el), resume: resumeUpload(el),
+      files: [...el.files].map(({ name, size, lastModified, type }) => ({ name, size, lastModified, type })),
+      existing: el.getAttribute("data-existing-file"), feedback: uploadFeedback(el, scope),
+      links: [...scope.querySelectorAll("a[href]")].filter(visible).map((link) => [link.getAttribute("href"), link.textContent, link.getAttribute("aria-label")]),
+    });
+    let state = uploadStates.get(el);
+    if (state?.signature !== signature) {
+      state = { signature, id: `${documentId}:upload:${++sequence}` };
+      uploadStates.set(el, state);
+    }
+    return state.id;
+  };
   const field = (el) => ({
     id: key(el),
     ...entry(el),
@@ -372,7 +388,7 @@ export function installWorld(binding, documentId) {
     ).slice(0, 400),
     section: section(el).slice(0, 200),
     type: unsupportedControl(el) || el.type || el.getAttribute("role") || el.tagName.toLowerCase(),
-    ...(el.type === "file" && { resumeUpload: resumeUpload(el) }),
+    ...(el.type === "file" && { resumeUpload: resumeUpload(el), uploadState: uploadState(el) }),
     value: String(value(el)),
     required: required(el),
     disabled: !!el.disabled || !!el.readOnly,
@@ -704,6 +720,8 @@ export function installWorld(binding, documentId) {
       if (login) return { ready: false, reason: login, needsLogin: true };
       const info = { label: label(el).slice(0, 400), actual: value(el) };
       const unavailable = (reason) => { pending(el, reason); return { ...info, ready: false, reason }; };
+      if (!packet.expectedUploadState || packet.expectedUploadState !== uploadState(el))
+        return { ...unavailable("上传入口或已有附件已变化，请重新检查并确认"), stale: true };
       if (!visible(el) || el.disabled) return unavailable("上传入口当前不可用");
       if (!resumeUpload(el)) return unavailable("未确认是简历上传入口，请本人核对附件用途");
       if (touched.has(el))

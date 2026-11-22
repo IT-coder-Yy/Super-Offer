@@ -121,7 +121,13 @@ async function setup(t, { applications = false } = {}) {
             return new Promise((resolve, reject) => { fixture.pending = { resolve, reject }; });
           }
           if (fixture.fields && request.command.kind === "inspect") return structuredClone(fixture.fields);
-          if (fixture.fields && request.command.kind === "upload") { fixture.uploads.push(request.command); return fixture.state; }
+          if (fixture.fields && request.command.kind === "upload") {
+            const field = fixture.fields.find((item) => item.id === request.command.fieldId);
+            if (!field || field.fieldToken !== request.command.fieldToken)
+              throw { code: "STALE_TASK", message: "页面或配套简历已变化，请重新核对。" };
+            fixture.uploads.push(request.command);
+            return fixture.state;
+          }
           if (fixture.fields && request.command.kind === "write_answer") {
             const field = fixture.fields.find((item) => item.id === request.command.fieldId);
             if (!field || field.fieldToken !== request.command.fieldToken)
@@ -243,7 +249,7 @@ test("配套附件替换只向明确的简历入口提供确认按钮", async (t
       required: false, disabled: false, touched: false };
     window.__browserPanelFixture.fields = [
       { ...common, id: "portfolio", label: "作品集", resumeUpload: false },
-      { ...common, id: "resume", label: "简历", resumeUpload: true },
+      { ...common, id: "resume", label: "简历", resumeUpload: true, fieldToken: "page-A-resume-A" },
     ];
     window.__browserPanelFixture.uploads = [];
   });
@@ -258,10 +264,18 @@ test("配套附件替换只向明确的简历入口提供确认按钮", async (t
   await dialog.getByRole("button", { name: "取消" }).click();
   assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.uploads), []);
   await replace.click();
+  await page.evaluate(() => { window.__browserPanelFixture.fields[1].fieldToken = "page-B-resume-B"; });
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await page.getByText("页面或配套简历已变化，请重新核对。", { exact: true }).first().waitFor();
+  assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.uploads), []);
+  await dialog.getByRole("button", { name: "取消" }).click();
+  await panel.getByRole("button", { name: "核对字段／处理待办" }).click();
+  await field.selectOption("resume");
+  await replace.click();
   await dialog.getByRole("button", { name: "确认", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
   assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.uploads), [
-    { kind: "upload", fieldId: "resume", confirmed: true },
+    { kind: "upload", fieldId: "resume", fieldToken: "page-B-resume-B", confirmed: true },
   ]);
 });
 

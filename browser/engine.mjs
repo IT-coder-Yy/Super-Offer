@@ -389,7 +389,8 @@ export class BrowserConnection {
   }
   fieldToken(field) {
     return createHash("sha256").update(JSON.stringify([
-      this.runId, this.documentId, this.generation, fieldIdentity(field), field.path,
+      this.runId, this.documentId, this.generation, this.profile?.id, fieldIdentity(field), field.path,
+      ...(field.type === "file" ? [field.resumeUpload, field.uploadState, this.profile?.attachment?.sha256] : []),
     ])).digest("hex");
   }
   async inspect(report = false) {
@@ -406,6 +407,7 @@ export class BrowserConnection {
       for (const field of fields) {
         field.fieldToken = this.fieldToken(field);
         field.value = displayText(field.value);
+        delete field.uploadState;
       }
       await this.changed();
     }
@@ -577,7 +579,7 @@ export class BrowserConnection {
     for (const field of fields) {
       this.check(generation);
       if (field.type === "file") {
-        await this.upload(field.id, false, generation);
+        await this.upload(field.id, false, generation, field.uploadState);
         if (this.status === "paused") return;
         await this.changed();
         continue;
@@ -765,15 +767,16 @@ export class BrowserConnection {
     await this.changed();
     return this.state();
   }
-  async upload(fieldId, confirmed, generation = this.generation) {
+  async upload(fieldId, confirmed, generation, expectedUploadState) {
     const attachment = this.profile?.attachment;
     const target = await this.evaluate(
       "uploadTarget",
-      this.packet({ fieldId, confirmed }),
+      this.packet({ fieldId, confirmed, expectedUploadState }),
     );
     this.check(generation);
     if (this.pauseForLogin(target)) return;
     const record = (result) => this.record({ fieldId, label: target.label || "上传附件", actual: target.actual || "", ...result });
+    if (confirmed && target.stale) throw stopped();
     if (!target.ready || !attachment) {
       record({ status: "pending", reason: target.reason || "所选档案没有可用配套简历" });
       return;
@@ -814,13 +817,15 @@ export class BrowserConnection {
       try {
         this.check(generation);
         if (inputs.length !== 1) {
+          if (confirmed) throw stopped();
           record({ status: "pending", reason: "无法确认唯一上传入口，请核对" });
           return;
         }
-        const current = await this.evaluate("uploadTarget", this.packet({ fieldId, confirmed }));
+        const current = await this.evaluate("uploadTarget", this.packet({ fieldId, confirmed, expectedUploadState }));
         this.check(generation);
         if (this.pauseForLogin(current)) return;
         if (!current.ready || current.marker !== target.marker || current.accept !== target.accept) {
+          if (confirmed) throw stopped();
           record({ status: "pending", reason: current.reason || "上传入口已变化，请核对" });
           return;
         }
@@ -853,15 +858,29 @@ export class BrowserConnection {
       });
     }
   }
-  async replaceAttachment(fieldId, confirmed) {
+  async replaceAttachment(fieldId, confirmed, fieldToken) {
     this.assertActive();
     if (!confirmed) throw new Error("替换附件需要确认");
+    if (typeof fieldToken !== "string" || !fieldToken) throw stopped();
     if (this.profileSelection?.status === "pending") throw new Error("档案切换尚未确认，请稍后重试");
+    const inspected = this.generation;
+    const field = await this.evaluate("fieldState", fieldId);
+    if (inspected !== this.generation || field?.type !== "file" || !field.uploadState ||
+        fieldToken !== this.fieldToken({ ...field, path: null })) throw stopped();
     const generation = this.generation = randomUUID();
     this.status = "running";
     await this.changed();
     this.check(generation);
-    await this.upload(fieldId, true, generation);
+    try {
+      await this.upload(fieldId, true, generation, field.uploadState);
+    } catch (error) {
+      if (generation === this.generation) {
+        this.status = "paused";
+        this.message = "附件或上传入口已变化，请重新检查后确认";
+        await this.changed();
+      }
+      throw error;
+    }
     if (generation !== this.generation) throw stopped();
     if (this.status === "running") this.status = "waiting";
     await this.changed();
@@ -975,7 +994,8 @@ export class BrowserConnection {
         if (!command.runId) throw stopped();
         return this.applyDraft(command.fieldId, command.value, command.fieldToken);
       case "upload":
-        return this.replaceAttachment(command.fieldId, command.confirmed);
+        if (!command.runId) throw stopped();
+        return this.replaceAttachment(command.fieldId, command.confirmed, command.fieldToken);
       case "advance":
         return this.advance(command.saveDraft === true);
       case "disconnect":

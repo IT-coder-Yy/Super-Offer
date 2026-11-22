@@ -122,6 +122,7 @@ pub enum BrowserCommand {
     },
     Upload {
         field_id: String,
+        field_token: String,
         confirmed: bool,
     },
     Advance {
@@ -960,10 +961,18 @@ impl BrowserHost {
             }
             BrowserCommand::Upload {
                 field_id,
+                field_token,
                 confirmed,
             } => {
+                if !confirmed {
+                    return Err(AppError::new(
+                        "CONFIRMATION_REQUIRED",
+                        "请先确认替换这个字段中的附件。",
+                    ));
+                }
+                text(&field_token, "附件确认标识", true, 200)?;
                 let run = self.current_run(dataset)?;
-                self.request(json!({"kind":"upload","runId":run.id,"fieldId":field_id,"confirmed":confirmed}))
+                self.request(json!({"kind":"upload","runId":run.id,"fieldId":field_id,"fieldToken":field_token,"confirmed":true}))
                     .await
             }
             BrowserCommand::Advance {
@@ -1823,16 +1832,18 @@ mod tests {
         ));
         assert!(
             serde_json::from_value::<BrowserCommand>(
-                json!({"kind":"upload","fieldId":"f1","confirmed":true,"path":"secret"})
+                json!({"kind":"upload","fieldId":"f1","fieldToken":"inspected","confirmed":true,"path":"secret"})
             )
             .is_err()
         );
-        assert!(
-            serde_json::from_value::<BrowserCommand>(
-                json!({"kind":"evaluate","script":"anything"})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<BrowserCommand>(
+            json!({"kind":"upload","fieldId":"f1","confirmed":true})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<BrowserCommand>(
+            json!({"kind":"evaluate","script":"anything"})
+        )
+        .is_err());
         assert!(
             serde_json::from_value::<BrowserCommand>(json!({"kind":"fill","mode":"blank"})).is_ok()
         );

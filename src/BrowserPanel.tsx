@@ -596,13 +596,15 @@ export function BrowserPanel({
                   onClick={() =>
                     choose(
                       "替换已有附件",
-                      "上传当前任务档案的配套简历；请确认允许替换网站已有附件。",
+                      "允许用刚核对的配套简历替换这个字段的附件吗？页面或档案变化后，需要重新核对。",
                       async () => {
                         await call({
                           kind: "upload",
                           fieldId,
+                          fieldToken: selectedField.fieldToken,
                           confirmed: true,
                         });
+                        await inspect();
                       },
                     )
                   }

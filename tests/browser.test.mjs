@@ -211,6 +211,53 @@ test("恢复历史清单保留旧版合法的长英文原文，新识别的页�
   assert.match(current.actual, /仅显示/);
 });
 
+test("R18 替换确认跨刷新或换档或更换已有简历后不能把文件交给浏览器", async (t) => {
+  const { page, connection } = await setup(t, await withTestAttachment(t, "synthetic A"));
+  const read = async () => (await connection.inspect(true)).find((f) => f.type === "file");
+  const request = async (field) => connection.dispatch({ kind: "upload", runId: connection.runId, fieldId: field.id, fieldToken: field.fieldToken, confirmed: true }).then(() => "sent", (e) => e.code);
+  const count = () => page.locator("#resume").evaluate((el) => el.files.length);
+  const first = await read(), firstDoc = connection.documentId;
+  await page.reload();
+  await until(() => connection.context && connection.documentId !== firstDoc, "等待新文档");
+  assert.equal((await read()).id, first.id);
+  const refresh = await request(first), afterRefresh = await count();
+  const beforeSwitch = await read(), next = await withTestAttachment(t, "synthetic B");
+  next.id = "合成乙";
+  await connection.switchProfile(next, []);
+  const switched = await request(beforeSwitch);
+  await page.locator("#resume").evaluate((el) => {
+    el.parentElement.insertAdjacentHTML("afterend", '<a id="prior-material" href="/old.pdf">原有简历.pdf</a>');
+  });
+  const beforeLink = await read();
+  await page.locator("#prior-material").evaluate((el) => { el.setAttribute("href", "/another.pdf"); });
+  const linkChanged = await request(beforeLink);
+  const missingToken = await request({ id: beforeLink.id });
+  const beforeCurrent = await count(), valid = await request(await read());
+  const actual = { refresh, afterRefresh, switched, linkChanged, missingToken, beforeCurrent, valid, content: await page.locator("#resume").evaluate((el) => el.files[0]?.text()) };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { refresh: "STALE_TASK", afterRefresh: 0, switched: "STALE_TASK", linkChanged: "STALE_TASK", missingToken: "STALE_TASK", beforeCurrent: 0, valid: "sent", content: "%PDF-1.7\nsynthetic B" });
+});
+
+test("R18 本机已读入配套简历、送往网站前已有附件变更时撤销替换", async (t) => {
+  const { page, connection } = await setup(t, await withTestAttachment(t));
+  await page.locator("#resume").evaluate((el) => {
+    el.parentElement.insertAdjacentHTML("afterend", '<a href="/prior.pdf">原简历.pdf</a>');
+    window.changes = 0;
+    el.addEventListener("change", () => window.changes++);
+  });
+  const field = (await connection.inspect(true)).find((f) => f.type === "file");
+  const evaluate = connection.evaluate.bind(connection);
+  let inspections = 0;
+  t.mock.method(connection, "evaluate", async (method, packet) => {
+    if (method === "uploadTarget" && ++inspections === 2)
+      await page.getByRole("link").evaluate((el) => { el.href = "/new-other.pdf"; });
+    return evaluate(method, packet);
+  });
+  const result = await connection.dispatch({ kind: "upload", runId: connection.runId, fieldId: field.id, fieldToken: field.fieldToken, confirmed: true }).then(() => "sent", (e) => e.code);
+  const actual = { result, files: await page.locator("#resume").evaluate((el) => el.files.length), changes: await page.evaluate(() => window.changes) };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { result: "STALE_TASK", files: 0, changes: 0 });
+});
 test("PR2 停止后按钮、草稿、草稿保存和继续均不能重新写，重选可另起任务", async (t) => {
   const { page, connection } = await setup(t);
   const field = (await connection.inspect(true)).find((f) => f.label === "为何选择此岗位");
@@ -1200,7 +1247,7 @@ test("检查后才出现的登录表单拦截旧字段草稿、下一步和附�
   await connection.advance(true);
   assert.equal(connection.status, "paused");
   connection.profile.attachment = { name: "fixture.pdf", path: "must-not-be-read", bytes: 0, sha256: "" };
-  await connection.replaceAttachment(file.id, true);
+  await assert.rejects(connection.replaceAttachment(file.id, true, file.fieldToken), { code: "STALE_TASK" });
   assert.equal(connection.status, "paused");
   assert.equal(await page.locator("#resume").evaluate((el) => el.files.length), 0);
   assert.equal(await page.evaluate(() => window.loginActions), 0);
@@ -1496,6 +1543,10 @@ async function withTestAttachment(t, content = "synthetic") {
   };
   return p;
 }
+async function confirmAttachment(connection, fieldId) {
+  const field = (await connection.inspect(true)).find((f) => f.id === fieldId);
+  return connection.dispatch({ kind: "upload", runId: connection.runId, fieldId, fieldToken: field.fieldToken, confirmed: true });
+}
 test("已有附件需确认，上传失败不阻塞其它字段，成功需页面状态", async (t) => {
   const { page, connection } = await setup(t, await withTestAttachment(t));
   await page.evaluate(() => {
@@ -1509,7 +1560,7 @@ test("已有附件需确认，上传失败不阻塞其它字段，成功需页�
     connection.state().results.some((x) => x.reason.includes("确认替换")),
   );
   const upload = (await connection.inspect()).find((x) => x.type === "file");
-  await connection.replaceAttachment(upload.id, true);
+  await confirmAttachment(connection, upload.id);
   assert.ok(
     connection.state().results.some((x) => x.reason.includes("上传失败")),
   );
@@ -1518,7 +1569,7 @@ test("已有附件需确认，上传失败不阻塞其它字段，成功需页�
     "https://example.invalid/code",
   );
   await page.evaluate(() => (window.failUpload = false));
-  await connection.replaceAttachment(upload.id, true);
+  await confirmAttachment(connection, upload.id);
   assert.ok(
     connection.state().results.some((x) => x.reason.includes("上传完成状态")),
   );
@@ -1550,7 +1601,7 @@ for (const mode of ["full", "blank"]) {
     const result = (field) => connection.state().results.find((row) => row.fieldId === field.id);
     assert.deepEqual(fields.map((f) => result(f).status), ["pending", "pending", "pending", "pending", "filled"]);
     for (const field of fields.slice(0, 4)) {
-      await connection.replaceAttachment(field.id, true);
+      await confirmAttachment(connection, field.id);
       assert.match(result(field).reason, /简历入口|简历上传入口/);
       assert.equal(result(field).label, field.label);
     }
@@ -1596,7 +1647,7 @@ test("配套附件在已有简历链接时先确认，原有成功字样不能�
   await fill(connection, "full");
   assert.equal(await page.evaluate(() => window.attachmentChanges), 0);
   await page.locator("output").evaluate((el) => { el.textContent = "上传成功"; });
-  await connection.replaceAttachment(resume.id, true);
+  await confirmAttachment(connection, resume.id);
   assert.equal(await page.locator("#resume").evaluate((el) => el.files[0].text()), "%PDF-1.7\nprofile B");
   assert.equal(await page.evaluate(() => window.attachmentChanges), 1);
   assert.equal(record().status, "verify");
