@@ -9,8 +9,8 @@ const stopped = () =>
   Object.assign(new Error("任务或页面已变化，请重新核对后继续。"), {
     code: "STALE_TASK",
   });
-const fieldIdentity = ({ id, label, section, type, entryId, entryIndex, autocomplete, options }) =>
-  ({ id, label, section, type, entryId, entryIndex, autocomplete, options });
+const fieldIdentity = ({ id, label, hasCaption, section, type, entryId, entryIndex, autocomplete, options }) =>
+  ({ id, label, hasCaption, section, type, entryId, entryIndex, autocomplete, options });
 const displayText = (text = "", limit = 12000) => {
   const suffix = "…（原文过长，仅显示部分）";
   const shown = text.length > limit ? text.slice(0, limit - suffix.length).toWellFormed() + suffix : text;

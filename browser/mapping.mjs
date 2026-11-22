@@ -71,6 +71,7 @@ const groupWords = {
   skills: /技能|语言|skill/i,
   intentions: /意向|求职|期望/i,
 };
+const otherPerson = /联系人|联络人|推荐人|证明人|监护人|家庭成员|emergency[\s_-]*contact|\b(?:referees?|references?)\b/i;
 export const repeated = new Set([
   "education",
   "experience",
@@ -84,6 +85,8 @@ export function inferMappings(fields) {
       return { ...field, path: null, reason: field.resumeUpload ? "使用档案的配套简历" : "未确认是简历上传入口，请本人核对附件用途" };
     if (["custom-select", "composite"].includes(field.type))
       return { ...field, path: null, reason: "自定义选项或复合控件请本人操作，不向内部输入框写入资料" };
+    if (otherPerson.test(field.label) || otherPerson.test(field.section))
+      return { ...field, path: null, reason: "此处涉及其他人的资料，请本人核对" };
     let group = Object.keys(groupWords).find((g) =>
       groupWords[g].test(field.section),
     );
@@ -99,7 +102,9 @@ export function inferMappings(fields) {
           names.some((x) => normalize(x) === name)
         )
           candidates.push({ group: owner, key });
-    if (!candidates.length && field.autocomplete) {
+    // autocomplete 描述数据类型；明确的题目或经历区块优先于这个提示。
+    if (!candidates.length && !group && field.autocomplete &&
+        (field.hasCaption === false || name === normalize(field.autocomplete) || /^(?:请输入|请填写|请选择)$/.test(name))) {
       const key = {
         name: "name",
         email: "email",

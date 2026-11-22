@@ -251,10 +251,12 @@ export function installWorld(binding, documentId) {
       .map((id) => document.getElementById(id)?.textContent ?? "")
       .join(" ")
       .trim();
-  const label = (el) =>
+  const caption = (el) =>
     labels(el).join(" ").trim() || labelledBy(el) ||
     formily(el)?.label ||
-    el.getAttribute("placeholder") ||
+    el.getAttribute("placeholder") || "";
+  const label = (el) =>
+    caption(el) ||
     el.getAttribute("name") ||
     el.id ||
     "未命名字段";
@@ -410,6 +412,7 @@ export function installWorld(binding, documentId) {
       : label(el)
     ).slice(0, 400),
     section: section(el).slice(0, 200),
+    hasCaption: !!caption(el),
     type: unsupportedControl(el) || el.type || el.getAttribute("role") || el.tagName.toLowerCase(),
     ...(el.type === "file" && { resumeUpload: resumeUpload(el), uploadState: uploadState(el) }),
     value: String(value(el)),
@@ -522,8 +525,8 @@ export function installWorld(binding, documentId) {
       JSON.stringify(current[key]) === JSON.stringify(value));
   };
   const identity = (el) => {
-    const { id, label, section, type, entryId, entryIndex, autocomplete, options } = field(el);
-    return { id, label, section, type, entryId, entryIndex, autocomplete, options };
+    const { id, label, section, hasCaption, type, entryId, entryIndex, autocomplete, options } = field(el);
+    return { id, label, section, hasCaption, type, entryId, entryIndex, autocomplete, options };
   };
   const staleField = (el) => {
     const reason = "当前字段或选项已变化，请重新检查";

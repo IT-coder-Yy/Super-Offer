@@ -171,6 +171,34 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>性别<select><option></option><option>女</option></select></label><label id="question"><span>姓名</span><input id="changing" autocomplete="name"></label>'
+      + '<fieldset><legend>紧急联系人</legend><label>姓名<input id="other-name" autocomplete="name"></label><label>电话<input id="other-phone" autocomplete="tel"></label></fieldset>'
+      + '<label>对接方登记名称<input id="other-caption" autocomplete="name"></label><label>姓名<input id="own-name" autocomplete="name"></label><input id="opaque-9" autocomplete="email"><label>GitHub<input id="tail"></label>';
+    form.querySelector("select").addEventListener("change", () => { form.querySelector("#question span").textContent = "紧急联系人姓名"; });
+  });
+  await fill(connection);
+  await fill(connection,"blank");
+  const afterBlank = await page.locator("#changing").inputValue();
+  const second = profile("第二档案"); second.data.basic.name="第二本人";
+  await connection.switchProfile(second,[]);
+  const { results } = await fill(connection,"full");
+  const values = await page.locator("input").evaluateAll(inputs=>Object.fromEntries(inputs.map(el=>[el.id,el.value])));
+  const contact = results.find(row=>row.label==="紧急联系人姓名");
+  t.diagnostic(JSON.stringify({afterBlank,values,contactStatus:contact?.status,path:contact?.path}));
+  assert.equal(afterBlank,"");
+  assert.equal(values.changing,"");
+  assert.equal(values["other-name"],""); assert.equal(values["other-phone"],"");
+  assert.equal(values["other-caption"],"");
+  assert.equal(values["own-name"],second.data.basic.name);
+  assert.equal(values["opaque-9"],second.data.basic.email);
+  assert.equal(values.tail,second.data.basic.github);
+  assert.equal(contact?.status,"pending"); assert.ok(!contact.path);
+  assert.equal(await page.evaluate(()=>window.submissions),0);
+});
+
 {
   const minimal = (name) => { const selected = profile(name); selected.data.education = []; return selected; };
   const result = (connection, label) => connection.results.findLast((item) => item.label === label);
