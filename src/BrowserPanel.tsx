@@ -74,7 +74,10 @@ export function BrowserPanel({
   const selectedField = fields.find((f) => f.id === fieldId);
   const live = status?.state;
   const selectedApplication = state.applications.find(
-    (a) => a.id === (status?.run?.applicationId || applicationId),
+    (a) => a.id === applicationId,
+  );
+  const selectedJob = state.jobs.find(
+    (job) => job.id === selectedApplication?.jobSnapshotId,
   );
   const call = <T,>(command: Record<string, unknown>) =>
     request<T>("browser", { datasetId: state.datasetId, command });
@@ -188,7 +191,10 @@ export function BrowserPanel({
   const confirmSubmitted = async () => {
     let application = selectedApplication;
     if (!application) return;
-    const usedVersion = status?.run?.profileVersionId;
+    const usedVersion =
+      status?.run?.applicationId === application.id
+        ? status.run.profileVersionId
+        : undefined;
     if (
       usedVersion &&
       application.profileVersionId !== usedVersion &&
@@ -541,12 +547,13 @@ export function BrowserPanel({
           disabled={
             busy ||
             !selectedApplication ||
+            !selectedJob ||
             !!selectedApplication.confirmedSubmittedAt
           }
           onClick={() =>
             choose(
               "确认已经实际提交",
-              "仅在你已经本人完成网站最终提交后记录为已投；此操作不会替你点击网站提交。",
+              `将“${selectedJob?.data.company} · ${selectedJob?.data.title}”记录为已投。仅在你已经本人完成网站最终提交后确认；此操作不会替你点击网站提交。`,
               confirmSubmitted,
             )
           }

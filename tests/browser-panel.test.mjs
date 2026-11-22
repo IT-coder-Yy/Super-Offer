@@ -38,7 +38,7 @@ before(async () => {
 });
 after(async () => { await browser?.close(); await server?.close(); });
 
-async function setup(t) {
+async function setup(t, { applications = false } = {}) {
   const data = emptyProfile();
   data.basic.name = "合成档案姓名";
   const workspace = { activity: { browser: false, source: false, interview: false },
@@ -46,6 +46,18 @@ async function setup(t) {
       profiles: [{ id: "profile-a", name: "合成档案", currentVersionId: "version-a", versions: [{ id: "version-a", profileId: "profile-a", createdAt: "2026-11-21T00:00:00Z", data }] }],
       jobs: [], applications: [], events: [], interviews: [], assets: [], providers: [], tasks: [] },
     providerStatus: [], dataDirectory: "合成隔离工作区" };
+  if (applications) {
+    workspace.state.profiles[0].versions.push({ id: "version-b", profileId: "profile-a", createdAt: "2026-11-21T01:00:00Z", data: structuredClone(data) });
+    for (const suffix of ["a", "b"]) {
+      const name = suffix.toUpperCase();
+      workspace.state.jobs.push({ id: `job-${suffix}`, createdAt: "2026-11-21T00:00:00Z", data: {
+        company: `合成公司${name}`, title: `合成岗位${name}`, channel: "合成校招", batch: "2026", jobCode: name, url: "", jd: "合成岗位说明",
+      } });
+      workspace.state.applications.push({ id: `application-${suffix}`, jobSnapshotId: `job-${suffix}`, profileVersionId: `version-${suffix}`,
+        stage: "pending", endReason: null, confirmedSubmittedAt: null, createdAt: "2026-11-21T00:00:00Z", updatedAt: "2026-11-21T00:00:00Z",
+        revision: 1, nextAction: "", dueAt: null, notes: "" });
+    }
+  }
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   let externalRequests = 0;
   const errors = [];
@@ -54,9 +66,9 @@ async function setup(t) {
     externalRequests++;
     return route.abort();
   });
-  await context.addInitScript(({ workspace, unrelatedFailure, connectedMessage }) => {
+  await context.addInitScript(({ workspace, unrelatedFailure, connectedMessage, applications }) => {
     const fixture = window.__browserPanelFixture = {
-      statusCalls: 0, connectionCalls: 0, pending: null,
+      statusCalls: 0, connectionCalls: 0, pending: null, mutations: [], applications: workspace.state.applications,
       state: { connected: false, targetId: null, documentId: null, generation: "initial", runId: null,
         status: "disconnected", message: "连接已关闭，已有进度保留", url: "", profileVersionId: null,
         profileName: "", results: [], pending: 0 },
@@ -71,6 +83,11 @@ async function setup(t) {
         }
       },
     };
+    if (applications) {
+      fixture.state.connected = true;
+      fixture.state.runId = "run-a";
+      fixture.run = { id: "run-a", applicationId: "application-a", profileVersionId: "version-a", state: fixture.state };
+    }
     let listener = 0;
     window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     window.__TAURI_INTERNALS__ = {
@@ -80,13 +97,24 @@ async function setup(t) {
         if (command !== "request") throw Error(`未定义 IPC ${command}`);
         const request = args.request;
         if (request.kind === "snapshot") return structuredClone(workspace);
+        if (request.kind === "mutate") {
+          const mutation = request.mutation;
+          fixture.mutations.push(mutation);
+          const application = workspace.state.applications.find((item) => item.id === mutation.id);
+          if (!application) throw Error("合成申请不存在");
+          if (mutation.kind === "update_application") application.profileVersionId = mutation.profileVersionId;
+          else if (mutation.kind === "confirm_submitted") { application.stage = "applied"; application.confirmedSubmittedAt = mutation.submittedAt; }
+          else throw Error(`未定义合成mutation ${mutation.kind}`);
+          application.revision++;
+          return { id: application.id };
+        }
         if (request.kind === "source" && request.command.kind === "list")
           return { versions: [], limits: { files: 100, fileBytes: 1000, totalBytes: 10000, encoding: "合成范围" } };
         if (request.kind === "interview" && request.command.kind === "list") return [];
         if (request.kind === "browser") {
           if (request.command.kind === "status") {
             fixture.statusCalls++;
-            return { state: structuredClone(fixture.state), run: null, history: [] };
+            return { state: structuredClone(fixture.state), run: structuredClone(fixture.run || null), history: [] };
           }
           if (request.command.kind === "connect") {
             fixture.connectionCalls++;
@@ -109,7 +137,7 @@ async function setup(t) {
         throw Error(`未定义合成请求 ${request.kind}/${request.command?.kind}`);
       },
     };
-  }, { workspace, unrelatedFailure, connectedMessage });
+  }, { workspace, unrelatedFailure, connectedMessage, applications });
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
   page.on("pageerror", (error) => errors.push(error.message));
@@ -140,6 +168,8 @@ async function capture(page, name) {
     connectionCalls: window.__browserPanelFixture.connectionCalls,
     statusCalls: window.__browserPanelFixture.statusCalls,
     connected: window.__browserPanelFixture.state.connected,
+    mutations: window.__browserPanelFixture.mutations,
+    applications: window.__browserPanelFixture.applications,
   }));
   const sourceHashes = {};
   for (const file of ["src/BrowserPanel.tsx", "src/App.tsx", "tests/browser-panel.test.mjs"])
@@ -233,6 +263,59 @@ test("配套附件替换只向明确的简历入口提供确认按钮", async (t
   assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.uploads), [
     { kind: "upload", fieldId: "resume", confirmed: true },
   ]);
+});
+
+test("确认岗位B只把B记已投，刷新旧任务不改目标也不套用A档案", async (t) => {
+  const { page, panel } = await setup(t, { applications: true });
+  assert.ok(await panel.getByRole("button", { name: "我已在网站完成提交", exact: true }).isDisabled());
+  await panel.getByLabel("关联申请（可选）").selectOption("application-b");
+  await panel.getByRole("button", { name: "我已在网站完成提交", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "确认已经实际提交", exact: true });
+  const displayed = await dialog.innerText();
+  await capture(page, "submission-confirmation");
+  const polls = await page.evaluate(() => {
+    const fixture = window.__browserPanelFixture;
+    fixture.run = { ...fixture.run, id: "refreshed-run", applicationId: "application-b" };
+    return fixture.statusCalls;
+  });
+  await page.waitForFunction((count) => window.__browserPanelFixture.statusCalls > count, polls);
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  await capture(page, "submission-result");
+  const result = await page.evaluate(() => ({ mutations: window.__browserPanelFixture.mutations, applications: window.__browserPanelFixture.applications }));
+  assert.deepEqual(result.mutations.filter((mutation) => mutation.kind === "confirm_submitted").map((mutation) => mutation.id), ["application-b"]);
+  assert.equal(result.applications.find((item) => item.id === "application-a").stage, "pending");
+  assert.equal(result.applications.find((item) => item.id === "application-b").stage, "applied");
+  assert.equal(result.applications.find((item) => item.id === "application-b").profileVersionId, "version-b");
+  assert.ok(displayed.includes("合成公司B") && displayed.includes("合成岗位B"));
+});
+
+test("同一申请提交时同步该任务档案，取消确认则不修改申请", async (t) => {
+  const { page, panel } = await setup(t, { applications: true });
+  const polls = await page.evaluate(() => {
+    window.__browserPanelFixture.run.profileVersionId = "version-b";
+    return window.__browserPanelFixture.statusCalls;
+  });
+  await page.waitForFunction((count) => window.__browserPanelFixture.statusCalls > count, polls);
+  await panel.getByLabel("关联申请（可选）").selectOption("application-a");
+  const submit = panel.getByRole("button", { name: "我已在网站完成提交", exact: true });
+  await submit.click();
+  const dialog = page.getByRole("dialog", { name: "确认已经实际提交", exact: true });
+  assert.ok((await dialog.innerText()).includes("合成公司A · 合成岗位A"));
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => window.__browserPanelFixture.mutations), []);
+  await submit.click();
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  const result = await page.evaluate(() => ({ mutations: window.__browserPanelFixture.mutations, applications: window.__browserPanelFixture.applications }));
+  assert.deepEqual(result.mutations.map(({ kind, id }) => ({ kind, id })), [
+    { kind: "update_application", id: "application-a" },
+    { kind: "confirm_submitted", id: "application-a" },
+  ]);
+  assert.equal(result.applications.find((item) => item.id === "application-a").profileVersionId, "version-b");
+  assert.equal(result.applications.find((item) => item.id === "application-a").stage, "applied");
+  assert.equal(result.applications.find((item) => item.id === "application-b").stage, "pending");
+  await capture(page, "same-application-profile-linked");
 });
 
 test("开放题确认绑定检查到的问题，刷新失败保留回答并可重新检查后写入", async (t) => {
