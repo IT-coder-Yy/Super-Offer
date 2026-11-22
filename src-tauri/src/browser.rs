@@ -455,9 +455,9 @@ impl BrowserHost {
         }
         self.active.store(state.connected, Ordering::SeqCst);
         *self.state.lock().map_err(|_| poisoned())? = state.clone();
-        if let Some(run_id) = current {
+        if let Some(run_id) = &state.run_id {
             let mut store = self.runtime.lock()?;
-            let mut run: FillRun = get(&store.conn, "fill_runs", &run_id)?;
+            let mut run: FillRun = get(&store.conn, "fill_runs", run_id)?;
             if run.dataset_id != store.dataset_id {
                 return Ok(());
             }
@@ -969,11 +969,18 @@ impl BrowserHost {
                     .await
             }
             BrowserCommand::Disconnect => {
-                if let Ok(run) = self.current_run(dataset) {
+                let selected = self.active_run.lock().map_err(|_| poisoned())?.clone();
+                if let Some(run_id) = &selected {
                     self.runtime
-                        .cancel_context(dataset, &format!("fill:{}", run.id))?;
+                        .cancel_context(dataset, &format!("fill:{run_id}"))?;
                 }
                 let result = self.request(json!({"kind":"disconnect"})).await;
+                if result.is_ok() {
+                    let mut active_run = self.active_run.lock().map_err(|_| poisoned())?;
+                    if *active_run == selected {
+                        *active_run = None;
+                    }
+                }
                 self.active.store(false, Ordering::SeqCst);
                 self.persistence_failed.store(false, Ordering::SeqCst);
                 self.drafts.lock().map_err(|_| poisoned())?.clear();
@@ -1546,6 +1553,37 @@ mod tests {
                 .results,
             state.results
         );
+    }
+    #[test]
+    fn unselected_connection_state_keeps_saved_progress() {
+        let (dir, runtime, run) = fixture();
+        let host = host(runtime.clone(), dir.path());
+        *host.active_run.lock().unwrap() = Some(run.id.clone());
+        let mut state = run.state.clone();
+        state.run_id = Some(run.id.clone());
+        state.url = "https://example.invalid/jobs/1".into();
+        state.pending = 1;
+        state.results.push(FieldResult {
+            label: "邮箱".into(),
+            status: "pending".into(),
+            ..Default::default()
+        });
+        host.accept_state(state.clone()).unwrap();
+        for (connected, status) in [(false, "disconnected"), (true, "ready")] {
+            host.accept_state(BrowserState {
+                connected,
+                status: status.into(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(host.state.lock().unwrap().status, status);
+            assert_eq!(
+                get::<FillRun>(&runtime.lock().unwrap().conn, "fill_runs", &run.id)
+                    .unwrap()
+                    .state,
+                state
+            );
+        }
     }
     #[test]
     fn result_limits_preserve_unicode_and_legacy_history_without_poisoning_backups() {

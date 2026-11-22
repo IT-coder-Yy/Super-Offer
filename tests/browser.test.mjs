@@ -171,6 +171,19 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("R18 主动断开保留同次填写的逐项快照，同时撤销原网页写权限", async (t) => {
+  const { page, connection, events } = await setup(t);
+  const before = await fill(connection);
+  // 仅保留整套测试共用的浏览器进程，实际关闭这个任务的页面会话。
+  t.mock.method(browser, "close", async () => {});
+  await connection.dispatch({ kind: "disconnect", runId: before.runId });
+  const saved = events.filter((e) => e.event === "state" && e.state.status === "disconnected").at(-1)?.state;
+  const actual = { before: before.results.length, after: saved.results.length, sameRun: saved.runId === before.runId, sameResults: JSON.stringify(saved.results) === JSON.stringify(before.results), active: !!connection.runId, overlay: await page.locator("#super-offer-controls").count() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.ok(actual.before > 0);
+  assert.deepEqual(actual, { before: before.results.length, after: before.results.length, sameRun: true, sameResults: true, active: false, overlay: 0 });
+});
+
 test("PR2 停止后按钮、草稿、草稿保存和继续均不能重新写，重选可另起任务", async (t) => {
   const { page, connection } = await setup(t);
   const field = (await connection.inspect(true)).find((f) => f.label === "为何选择此岗位");

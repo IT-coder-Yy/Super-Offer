@@ -138,13 +138,8 @@ export class BrowserConnection {
     this.browser = browser;
     this.status = "connected";
     this.message = "请选择本次申请页面";
-    browser.on("disconnected", () => {
-      this.generation = randomUUID();
-      this.context = null;
-      this.status = "disconnected";
-      this.message = "浏览器已断开，进度保留；重连后重新核对页面";
-      this.emit({ event: "state", state: this.state() });
-    });
+    this.onDisconnected = () => { if (this.browser === browser) void this.disconnect(false); };
+    browser.on("disconnected", this.onDisconnected);
   }
   async listTargets() {
     if (!this.browser?.isConnected()) throw new Error("请先连接浏览器。");
@@ -919,14 +914,19 @@ export class BrowserConnection {
     await disposing;
     if (session) await session.detach().catch(() => {});
   }
-  async disconnect() {
-    await this.detach();
+  async disconnect(closeBrowser = true) {
+    const previous = this.state();
     const browser = this.browser;
+    if (this.onDisconnected) browser?.off("disconnected", this.onDisconnected);
     this.browser = null;
-    if (browser) await browser.close().catch(() => {});
+    const detaching = this.detach();
     this.status = "disconnected";
     this.message = "连接已关闭，已有进度保留";
-    this.emit({ event: "state", state: this.state() });
+    const state = { ...previous, connected: false, targetId: null, documentId: null, generation: this.generation, status: this.status, message: this.message };
+    this.emit({ event: "state", state });
+    await detaching;
+    if (closeBrowser) await browser?.close().catch(() => {});
+    return state;
   }
   async dispatch(command) {
     if (["fill", "draft", "upload", "advance", "inspect"].includes(command.kind) &&
@@ -970,8 +970,7 @@ export class BrowserConnection {
         return this.advance(command.saveDraft === true);
       case "disconnect":
         if (command.runId && command.runId !== this.runId) throw stopped();
-        await this.disconnect();
-        return this.state();
+        return this.disconnect();
       default:
         throw new Error("不支持的浏览器命令");
     }
