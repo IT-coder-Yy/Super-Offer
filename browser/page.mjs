@@ -281,6 +281,15 @@ export function installWorld(binding, documentId) {
     return !selected.value || radios(el).filter((x) => x.value === selected.value).length > 1
       ? label(selected) : selected.value;
   };
+  const optionDisabled = (option) => option.disabled ||
+    (option.parentElement?.tagName === "OPTGROUP" && option.parentElement.disabled);
+  const choiceOf = (el) => el.tagName === "SELECT" ? el.selectedOptions[0]
+    : el.type === "radio" ? radios(el).find((x) => x.checked) : undefined;
+  const selectValue = (el, selected = choiceOf(el)) => {
+    if (!selected || (!selected.value && selected.index === 0)) return "";
+    return [...el.options].filter((option) => option.value === selected.value).length > 1
+      ? selected.label : selected.value;
+  };
   const value = (el) =>
     // 尚无该选择器已选项的可靠DOM依据，搜索词不能当作已选城市。
     atsxSelect(el)
@@ -291,6 +300,8 @@ export function installWorld(binding, documentId) {
       ? [...(el.files ?? [])].map((x) => x.name).join(", ")
       : el.type === "radio"
         ? radioValue(el)
+        : el.tagName === "SELECT"
+          ? selectValue(el)
         : el.type === "checkbox"
           ? el.checked
             ? el.value || label(el)
@@ -407,8 +418,7 @@ export function installWorld(binding, documentId) {
     options:
       el.tagName === "SELECT"
         ? [...el.options]
-            .filter((x) => !x.disabled)
-            .map((x) => ({ value: x.value, label: x.label }))
+            .map((x) => ({ id: key(x), value: x.value, label: x.label, disabled: !!optionDisabled(x) }))
         : el.type === "radio"
           ? radios(el).map((x) => ({ id: key(x), value: x.value, label: label(x), disabled: !!x.disabled }))
           : [],
@@ -532,16 +542,14 @@ export function installWorld(binding, documentId) {
       if (!el.isConnected || !visible(el) || el.disabled || el.readOnly || !matchesExpected(el, attempt.expected))
         reason = "写入后字段已变化，保留现场，请重新检查";
       else if (touched.has(el)) reason = "用户已编辑，保留手改内容";
-      else if (actual !== attempt.value ||
-          (el.type === "radio" && radios(el).find((x) => x.checked) !== attempt.choice))
+      else if (actual !== attempt.value || choiceOf(el) !== attempt.choice)
         reason = "页面随后改变了内容，保留现场，请核对";
       else if (!validValue(el)) {
         // 仅撤回仍能确认属于本代次、原控件且未被手改的这次写入。
         writes.delete(el);
         try { attempt.restore(); } catch { /* 以下回读报告恢复是否完成。 */ }
         actual = String(value(el));
-        const restored = actual === attempt.before &&
-          (el.type !== "radio" || radios(el).find((x) => x.checked) === attempt.beforeChoice);
+        const restored = actual === attempt.before && choiceOf(el) === attempt.beforeChoice;
         if (restored && attempt.previous) owned.set(el, attempt.previous);
         else owned.delete(el);
         reason = restored ? "页面随后校验未通过，已恢复写入前内容，请核对" : "页面随后校验未通过，网站未恢复原值，请本人核对";
@@ -578,8 +586,7 @@ export function installWorld(binding, documentId) {
     if (login) return { ...result, reason: login, needsLogin: true };
     if (!el?.isConnected || !visible(el)) return fail("字段已消失或不可访问");
     if (!matchesExpected(el, packet.expected)) return { ...result, ...staleField(el) };
-    const current = String(value(el)), previous = owned.get(el),
-      beforeChoice = el.type === "radio" ? radios(el).find((x) => x.checked) : undefined;
+    const current = String(value(el)), previous = owned.get(el), beforeChoice = choiceOf(el);
     if (current.trim() && (packet.mode === "blank" || touched.has(el))) {
       if (!validValue(el)) return fail("页面校验未通过，保留原有内容，请本人修正");
       clearPending(el);
@@ -598,27 +605,27 @@ export function installWorld(binding, documentId) {
       return current && previous
         ? fail("换档缺值，保留旧内容，请人工核对")
         : fail("档案缺少此项");
-    if (current && (!previous || previous.value !== current ||
-        (el.type === "radio" && previous.choice !== beforeChoice)))
+    if (current && (!previous || previous.value !== current || previous.choice !== beforeChoice))
       return fail("原有内容或来源无法确认，已保留");
     if (
       ["checkbox", "file"].includes(el.type) ||
       !["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)
     )
       return fail("此控件需要人工选择或附件操作");
+    if (el.tagName === "SELECT" && el.multiple) return fail("多选下拉请本人核对选择");
     let wanted = String(packet.value), choice;
     if (el.type === "radio" || el.tagName === "SELECT") {
       const radio = el.type === "radio";
       const options = (radio ? radios(el) : [...el.options]).filter(
         (x) =>
-          !x.disabled && (!radio || visible(x)) &&
+          !(radio ? x.disabled : optionDisabled(x)) && (!radio || visible(x)) &&
           (normalize(x.value) === normalize(wanted) ||
             normalize(radio ? label(x) : x.label) === normalize(wanted)),
       );
       if (!options.length) return fail("找不到对应选项");
       if (options.length !== 1) return fail("选项存在歧义，请本人选择");
       choice = options[0];
-      wanted = radio ? radioValue(el, choice) : choice.value;
+      wanted = radio ? radioValue(el, choice) : selectValue(el, choice);
     }
     if (el.type === "month" && /^\d{4}-\d{2}-\d{2}$/.test(wanted))
       wanted = wanted.slice(0, 7);
@@ -640,6 +647,9 @@ export function installWorld(binding, documentId) {
           if (selected && group.includes(selected)) { selected.click(); return; }
           const checked = group.find((x) => x.checked);
           if (checked) checked.checked = false;
+        } else if (el.tagName === "SELECT") {
+          const index = [...el.options].indexOf(selected);
+          Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "selectedIndex").set.call(el, index);
         } else setter.call(el, v);
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -659,20 +669,19 @@ export function installWorld(binding, documentId) {
     if (!safe(packet)) return { ...result, status: "stale", actual, reason: "任务或页面已变化" };
     if (!el.isConnected || touched.has(el)) return { ...result, status: "verify", actual, reason: "字段已变化或用户已编辑，请核对实际内容" };
     if (!matchesExpected(el, packet.expected)) return { ...result, ...staleField(el) };
-    if (reason || actual !== wanted || !validValue(el) ||
-        (el.type === "radio" && radios(el).find((x) => x.checked) !== choice)) {
-      if (actual !== current || (el.type === "radio" && radios(el).find((x) => x.checked) !== beforeChoice)) {
+    if (reason || actual !== wanted || !validValue(el) || choiceOf(el) !== choice) {
+      if (actual !== current || choiceOf(el) !== beforeChoice) {
         try { writeValue(current, beforeChoice); } catch { /* 按下方实际回读报告。 */ }
       }
       const restored = String(value(el));
       if (!reason) reason = "写后回读或页面校验未通过";
-      if (restored !== current) {
+      if (restored !== current || choiceOf(el) !== beforeChoice) {
         owned.delete(el);
         reason += "，网站未恢复原值，请本人核对";
       }
       return { ...fail(reason), actual: restored };
     }
-    owned.set(el, { value: actual, ...(el.type === "radio" && { choice }) });
+    owned.set(el, { value: actual, choice });
     writes.set(el, { generation: packet.generation, value: actual, choice,
       before: current, beforeChoice, previous, expected: identity(el),
       restore: () => writeValue(current, beforeChoice) });

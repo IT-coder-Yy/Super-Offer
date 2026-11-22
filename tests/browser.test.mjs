@@ -171,6 +171,69 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+{
+  const minimal = (name) => { const selected = profile(name); selected.data.education = []; return selected; };
+  const result = (connection, label) => connection.results.findLast((item) => item.label === label);
+  test("R19 DOM 原生同值下拉按具体选项填写并跳过disabled optgroup", async (t) => {
+    const snapshots = [];
+    for (const disabled of [false, true]) {
+      const { page, connection } = await setup(t, minimal());
+      await page.locator("form").evaluate((form, disabled) => {
+        form.innerHTML = '<label>性别<select id="gender"><option value="">请选择</option>' +
+          (disabled ? '<optgroup disabled label="停用"><option value="same">女</option></optgroup>' : '<option value="same">男</option>') +
+          '<option id="wanted" value="same">女</option></select></label><button type="submit">最终提交申请</button>';
+      }, disabled);
+      await fill(connection);
+      snapshots.push({ disabled, actual: await page.locator("#gender").evaluate((el) => ({ id: el.selectedOptions[0].id, label: el.selectedOptions[0].label })),
+        status: result(connection, "性别").status, recorded: result(connection, "性别").actual, submissions: await page.evaluate(() => window.submissions) });
+    }
+    t.diagnostic(JSON.stringify(snapshots));
+    assert.deepEqual(snapshots, [false, true].map((disabled) => ({ disabled, actual: { id: "wanted", label: "女" }, status: "filled", recorded: "女", submissions: 0 })));
+  });
+  test("R19 DOM 下拉歧义、停用项、原有值与用户手改均不猜选", async (t) => {
+    const rows = [];
+    for (const mode of ["ambiguous-label", "ambiguous-value", "disabled", "existing", "manual"]) {
+      const selected = minimal();
+      if (mode === "ambiguous-value") selected.data.basic.gender = "same";
+      const { page, connection } = await setup(t, selected);
+      await page.locator("form").evaluate((form, mode) => {
+        const choices = mode === "ambiguous-label" ? '<option value="a">女</option><option value="b">女</option>'
+          : mode === "disabled" ? '<optgroup disabled label="停用"><option value="same">女</option></optgroup>'
+            : '<option value="same"' + (mode === "existing" ? ' selected' : '') + '>男</option><option value="same">女</option>';
+        form.innerHTML = '<label>性别<select id="gender"><option value=""></option>' + choices + '</select></label>';
+      }, mode);
+      if (mode === "manual") { await page.locator("#gender").focus(); await page.locator("#gender").press("ArrowDown"); }
+      await fill(connection);
+      rows.push({ mode, index: await page.locator("#gender").evaluate((el) => el.selectedIndex), status: result(connection, "性别").status });
+    }
+    t.diagnostic(JSON.stringify(rows));
+    assert.deepEqual(rows, [
+      { mode: "ambiguous-label", index: 0, status: "pending" }, { mode: "ambiguous-value", index: 0, status: "pending" },
+      { mode: "disabled", index: 0, status: "pending" }, { mode: "existing", index: 1, status: "pending" }, { mode: "manual", index: 1, status: "preserved" },
+    ]);
+  });
+  test("R19 DOM 同值下拉校验失败恢复原选项，网站选反不能报成功", async (t) => {
+    for (const refusal of ["invalid", "reversed", "late"]) {
+      const selected = minimal(); selected.data.basic.gender = "男";
+      const { page, connection } = await setup(t, selected);
+      await page.locator("form").evaluate((form) => { form.innerHTML = '<label>性别<select id="gender"><option value=""></option><option value="same">男</option><option value="same">女</option></select></label>'; });
+      await fill(connection);
+      await page.locator("#gender").evaluate((el, refusal) => el.addEventListener("change", () => {
+        if (refusal === "reversed" && el.selectedIndex === 2) el.selectedIndex = 1;
+        if (refusal === "late" && el.selectedIndex === 2)
+          setTimeout(() => el.setCustomValidity("迟到的选项拒收"), 139);
+        el.setCustomValidity(refusal === "invalid" && el.selectedIndex === 2 ? "选项拒收" : "");
+      }), refusal);
+      await connection.switchProfile(minimal("乙"), []);
+      await fill(connection);
+      if (refusal === "late") await until(() => result(connection, "性别")?.status === "pending", "等待同值选项迟到校验恢复");
+      const row = result(connection, "性别"), actual = { refusal, index: await page.locator("#gender").evaluate((el) => el.selectedIndex), status: row.status, value: row.actual };
+      t.diagnostic(JSON.stringify(actual));
+      assert.deepEqual(actual, { refusal, index: 1, status: "pending", value: "男" });
+    }
+  });
+}
+
 test("R18 DOM 迟到139ms校验恢复合法旧邮箱，其他字段继续且结果更新", async (t) => {
   const { page, connection } = await setup(t);
   await fill(connection);
