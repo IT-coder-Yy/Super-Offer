@@ -417,7 +417,8 @@ export function InterviewPanel({ workspace, reload, notify, onDirty }: S3PanelPr
       </fieldset>
       <Field label="我实际负责的内容" hint="只写能够确认的个人动作；源码存在不会自动算成个人贡献。"><textarea rows={4} value={creation.contribution} onChange={(e) => setCreation({ ...creation, contribution: e.target.value })} /></Field>
       <Field label="本场重点／检索关键词（可选）"><textarea rows={3} value={creation.focus} onChange={(e) => setCreation({ ...creation, focus: e.target.value })} placeholder="例如 工具调用、任务取消、状态恢复；可加入具体函数名。" /></Field>
-      <p className="muted">每题最多2次追问；回答充分、没有新信息、不会或跳过时结束该题。题量规则不限制AI调用次数。档案、JD和获准项目片段将按题发送到你配置的聊天服务。</p>
+      <p className="muted">每题最多2次追问；回答充分、没有新信息、不会或跳过时结束该题。题量规则不限制AI调用次数。</p>
+      <p className="muted">生成问题与反馈时，会向你配置的聊天服务发送已确认的简历文字、所选岗位、已有题目和已发送的回答、本人说明、面试设置及获准项目片段。完整结构化档案仅用于本地关联。</p>
     </Dialog>}
     {evidence && <Dialog title="固定版本引用" wide onCancel={() => setEvidence(null)} actions={<button onClick={() => setEvidence(null)}>关闭</button>}><EvidenceView evidence={evidence} /></Dialog>}
     {correction && current && <Dialog title="核对并更正报告条目" wide busy={busy} onCancel={() => setCorrection(null)} actions={<>

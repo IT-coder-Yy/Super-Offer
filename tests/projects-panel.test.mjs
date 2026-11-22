@@ -122,6 +122,21 @@ async function search(page, query, text, index = 0) {
   await page.waitForFunction(i => !!window.projectFixture.searches[i], index);
 }
 
+test("新建面试说明实际外发材料，完整结构化档案仅留在本地", async t => {
+  const { page } = await setup(t);
+  await page.getByRole("navigation").getByRole("button", { name: "文字面试", exact: true }).click();
+  await page.getByRole("button", { name: "新建文字面试", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "新建文字面试", exact: true });
+  await dialog.waitFor();
+  const text = await dialog.innerText();
+  for (const material of ["已确认的简历文字", "所选岗位", "已发送的回答", "本人说明", "面试设置", "获准项目片段"]) {
+    assert.ok(text.includes(material), `缺少外发材料说明：${material}`);
+  }
+  assert.ok(text.includes("完整结构化档案仅用于本地关联"));
+  assert.ok(!text.includes("档案、JD和获准项目片段将按题发送"));
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+});
+
 test("同一检索按两次回车只启动一次，停止后迟到的结果不显示", async t => {
   const { page, panel, query, rows } = await setup(t);
   await search(page, query, "first");
