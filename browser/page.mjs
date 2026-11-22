@@ -911,7 +911,11 @@ export function installWorld(binding, documentId) {
         reason: "已选择文件，仍需核对网站上传完成状态",
       };
     },
-    dispose() {
+    dispose(packet) {
+      if (packet && packet.documentId !== documentId) return [];
+      // 只收已经发生的校验结果；撤权后不再为断开操作改动网页内容。
+      const results = packet?.documentId === documentId && packet.generation === view.generation &&
+        ["running", "waiting"].includes(view.status) ? [...validationResults.values()] : [];
       view = { ...view, generation: "", status: "stopped", connected: false };
       clearInterval(lease);
       observer.disconnect();
@@ -925,6 +929,7 @@ export function installWorld(binding, documentId) {
       document.removeEventListener("change", onInput, true);
       host.remove();
       delete globalThis.__superOffer;
+      return results;
     },
   };
   send("ready");

@@ -16,6 +16,24 @@ const displayText = (text = "", limit = 12000) => {
   const shown = text.length > limit ? text.slice(0, limit - suffix.length).toWellFormed() + suffix : text;
   return shown.toWellFormed().replaceAll("\0", "␀");
 };
+const pendingCount = (results) => results.filter((r) => ["pending", "verify"].includes(r.status)).length;
+function applyValidation(results, documentId, changes, finalUrl) {
+  for (const change of changes) {
+    const index = results.findIndex((r) => r.documentId === documentId && r.fieldId === change.fieldId);
+    const original = results[index];
+    if (!original && finalUrl === undefined) continue;
+    const item = {
+      documentId, url: finalUrl, ...original, ...change,
+      label: displayText(change.label, 400), actual: displayText(change.actual),
+      path: original && original.label === change.label ? original.path : null,
+    };
+    if (original) results[index] = item;
+    else {
+      if (results.length >= 5000) results.shift();
+      results.push(item);
+    }
+  }
+}
 const jobRoute = /^(?:jobs?|positions?|job[-_]?info|(?:job|position)[-_]?details?)$/i;
 function jobReferences(address) {
   const url = new URL(address), references = {};
@@ -95,9 +113,7 @@ export class BrowserConnection {
       profileVersionId: this.profile?.id || null,
       profileName: this.profile?.name || "",
       results: this.results,
-      pending: this.results.filter((x) =>
-        ["pending", "verify"].includes(x.status),
-      ).length,
+      pending: pendingCount(this.results),
     };
   }
   async changed(fieldFinished = false) {
@@ -426,7 +442,7 @@ export class BrowserConnection {
       returnByValue: true,
       awaitPromise: true,
     });
-    if (contextId !== this.context || session !== this.session) throw stopped();
+    if (!["dispose", "reconcile"].includes(method) && (contextId !== this.context || session !== this.session)) throw stopped();
     if (result.exceptionDetails || result.result.value === undefined)
       throw stopped();
     return result.result.value;
@@ -535,12 +551,13 @@ export class BrowserConnection {
   async reconcile() {
     if (!this.context || this.runStopped || !["running", "waiting"].includes(this.status)) return;
     const generation = this.generation;
-    const results = await this.evaluate("reconcile", this.packet()).catch(() => []);
-    if (generation !== this.generation) return;
-    for (const result of results) {
-      const original = this.results.find((r) => r.documentId === this.documentId && r.fieldId === result.fieldId);
-      if (original) this.record({ ...original, ...result, path: result.label === original.label ? original.path : null });
-    }
+    if (this.reconciliation?.generation === generation) return this.reconciliation.promise;
+    const current = this.reconciliation = { generation };
+    current.promise = this.evaluate("reconcile", this.packet()).catch(() => []).then((results) => {
+      if (generation === this.generation) applyValidation(this.results, this.documentId, results);
+      return results;
+    }).finally(() => { if (this.reconciliation === current) this.reconciliation = null; });
+    return current.promise;
   }
   async fill(mode = "full", autoAdvance = this.autoAdvance, automatic = false) {
     this.assertActive();
@@ -1005,7 +1022,7 @@ export class BrowserConnection {
     await this.changed();
     return this.state();
   }
-  async detach() {
+  async detach(finalPacket) {
     this.selection = null;
     this.generation = randomUUID();
     this.profileSelection = null;
@@ -1013,7 +1030,7 @@ export class BrowserConnection {
     clearInterval(this.heartbeat);
     this.heartbeat = null;
     if (this.page && this.closeListener) this.page.off("close", this.closeListener);
-    const disposing = this.context && this.evaluate("dispose").catch(() => {});
+    const disposing = this.context && this.evaluate("dispose", finalPacket).catch(() => []);
     const session = this.session;
     this.context = null;
     this.session = null;
@@ -1026,20 +1043,24 @@ export class BrowserConnection {
     this.results = [];
     this.status = this.browser?.isConnected() ? "connected" : "disconnected";
     this.message = this.status === "connected" ? "请选择本次申请页面" : "尚未连接浏览器";
-    await disposing;
+    const validations = await disposing;
     if (session) await session.detach().catch(() => {});
+    return validations || [];
   }
   async disconnect(closeBrowser = true) {
     const previous = this.state();
+    const pending = this.reconciliation?.generation === previous.generation ? this.reconciliation.promise : null;
     const browser = this.browser;
     if (this.onDisconnected) browser?.off("disconnected", this.onDisconnected);
     this.browser = null;
-    const detaching = this.detach();
+    const detaching = this.detach(this.packet());
     this.status = "disconnected";
     this.message = "连接已关闭，已有进度保留";
     const state = { ...previous, connected: false, targetId: null, documentId: null, generation: this.generation, status: this.status, message: this.message };
+    // detach 已同步撤销运行权限；只合并原文档已回读和撤下浮框时带回的结果。
+    applyValidation(state.results, previous.documentId, [...(await pending || []), ...await detaching], previous.url);
+    state.pending = pendingCount(state.results);
     this.emit({ event: "state", state });
-    await detaching;
     if (closeBrowser) await browser?.close().catch(() => {});
     return state;
   }

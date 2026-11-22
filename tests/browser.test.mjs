@@ -171,6 +171,108 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("R19 主动断开先撤写权限，已发生的网页回滚进入最后的进度", async (t) => {
+  const { page, connection, events } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>邮箱<input type="email" id="email"></label>';
+    const email = form.querySelector("input");
+    email.oninput = () => { if (email.value !== "later@example.invalid") email.removeAttribute("aria-invalid"); };
+  });
+  await fill(connection);
+  const next = profile("合成乙");
+  next.data.basic.email = "later@example.invalid";
+  await connection.switchProfile(next, []);
+  await fill(connection);
+  await page.locator("#email").evaluate((el) => el.setAttribute("aria-invalid", "true"));
+  await page.waitForFunction((value) => document.querySelector("#email").value === value, profile().data.basic.email);
+  t.mock.method(browser, "close", async () => {});
+  const runId = connection.runId;
+  const closing = connection.dispatch({ kind: "disconnect", runId });
+  await assert.rejects(connection.dispatch({ kind: "fill", mode: "full", runId }), { code: "STALE_TASK" });
+  const returned = await closing;
+  const saved = events.findLast((e) => e.event === "state" && e.state.status === "disconnected").state;
+  const row = saved.results.find((r) => r.label === "邮箱");
+  const actual = { webpage: await page.locator("#email").inputValue(), marked: !!await page.locator("#email").getAttribute("data-super-offer-pending"),
+    recorded: row.actual, status: row.status, pending: saved.pending, sameRun: returned.runId === runId && saved.runId === runId, overlay: await page.locator("#super-offer-controls").count() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { webpage: profile().data.basic.email, marked: true, recorded: profile().data.basic.email, status: "pending", pending: 1, sameRun: true, overlay: 0 });
+});
+
+test("R19 断开时心跳已从网页读走的校验回执仍归档至原任务", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>邮箱<input type="email"></label>';
+    const input = form.querySelector("input");
+    input.oninput = () => { if (!input.value) input.removeAttribute("aria-invalid"); };
+  });
+  await fill(connection);
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const evaluate = connection.evaluate.bind(connection);
+  t.mock.method(connection, "evaluate", async (method, packet) => {
+    const result = await evaluate(method, packet);
+    if (method === "reconcile" && result.length) { entered.resolve(); await release.promise; }
+    return result;
+  });
+  await page.locator("input").evaluate((el) => el.setAttribute("aria-invalid", "true"));
+  await page.waitForFunction(() => document.querySelector("input").value === "");
+  const tick = connection.changed();
+  await entered.promise;
+  t.mock.method(browser, "close", async () => {});
+  const closing = connection.dispatch({ kind: "disconnect", runId: connection.runId });
+  release.resolve();
+  const [state] = await Promise.all([closing, tick]);
+  const actual = { status: state.results[0].status, recorded: state.results[0].actual, webpage: await page.locator("input").inputValue(), pending: state.pending };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { status: "pending", recorded: "", webpage: "", pending: 1 });
+});
+
+test("R19 首个字段已写后被网站回滚，填写回执在途时断开也能恢复此项", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>邮箱<input type="email"></label><label>GitHub<input id="tail"></label>';
+    const email = form.querySelector("input");
+    email.oninput = () => { if (!email.value) email.removeAttribute("aria-invalid"); };
+  });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const evaluate = connection.evaluate.bind(connection);
+  t.mock.method(connection, "evaluate", async (method, packet) => {
+    const value = await evaluate(method, packet);
+    if (method === "write" && value.label === "邮箱") { entered.resolve(); await release.promise; }
+    return value;
+  });
+  await connection.fill("full", false);
+  await entered.promise;
+  await page.locator('input[type=email]').evaluate((el) => el.setAttribute("aria-invalid", "true"));
+  await page.waitForFunction(() => document.querySelector('input[type=email]').value === "");
+  t.mock.method(browser, "close", async () => {});
+  const final = await connection.dispatch({ kind: "disconnect", runId: connection.runId });
+  release.resolve();
+  await connection.job;
+  const row = final.results.find((r) => r.label === "邮箱");
+  const actual = { status: row?.status ?? null, recorded: row?.actual ?? null, pending: final.pending, tail: await page.locator("#tail").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { status: "pending", recorded: "", pending: 1, tail: "" });
+});
+
+test("R19 新一轮填写尚未更新到网页时断开也会撤掉上一代浮框", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => { form.innerHTML = '<label>姓名<input></label>'; });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const evaluate = connection.evaluate.bind(connection);
+  t.mock.method(connection, "evaluate", async (method, packet) => {
+    if (method === "update" && packet.status === "running") { entered.resolve(); await release.promise; }
+    return evaluate(method, packet);
+  });
+  const started = connection.fill("full", false).catch((error) => error.code);
+  await entered.promise;
+  t.mock.method(browser, "close", async () => {});
+  const final = await connection.dispatch({ kind: "disconnect", runId: connection.runId });
+  release.resolve();
+  const actual = { status: final.status, interrupted: await started, overlay: await page.locator("#super-offer-controls").count(), name: await page.locator("form input").inputValue() };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { status: "disconnected", interrupted: "STALE_TASK", overlay: 0, name: "" });
+});
+
 test("R19 再次补空或换档时仍不会把本人资料填给紧急联系人", async (t) => {
   const { page, connection } = await setup(t);
   await page.locator("form").evaluate((form) => {
