@@ -4,6 +4,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, hash_map::Entry},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -12,9 +13,11 @@ use std::{
 pub struct Store {
     pub root: PathBuf,
     pub dataset_id: String,
+    pub(crate) credential_namespace: String,
     pub conn: Connection,
     _lock: fs::File,
 }
+pub(crate) const CREDENTIAL_NAMESPACE_FILE: &str = "credential-namespace";
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -86,8 +89,22 @@ pub fn connect(path: &Path) -> Result<Connection> {
             ));
         }
         migrate(&mut conn, include_str!("../migrations/001_initial.sql"))?;
+        migrate_to_current(&mut conn)?;
     }
     Ok(conn)
+}
+pub(crate) fn migrate_to_current(conn: &mut Connection) -> Result<()> {
+    match conn.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))? {
+        1 => migrate(
+            conn,
+            include_str!("../migrations/002_browser_interview.sql"),
+        ),
+        SCHEMA_VERSION => Ok(()),
+        _ => Err(AppError::new(
+            "VERSION_UNSUPPORTED",
+            "没有可用的数据迁移路径，原数据保持不变。",
+        )),
+    }
 }
 pub(crate) fn migrate(conn: &mut Connection, sql: &str) -> Result<()> {
     let tx = conn.transaction()?;
@@ -142,6 +159,15 @@ impl Store {
             ));
         }
         fs::create_dir_all(dir.join("assets"))?;
+        // Only local upgrades inherit this sidecar; it is never part of a portable backup.
+        let credential_namespace = match fs::read_to_string(dir.join(CREDENTIAL_NAMESPACE_FILE)) {
+            Ok(value) => value.trim().to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => dataset_id.clone(),
+            Err(error) => return Err(error.into()),
+        };
+        uuid::Uuid::parse_str(&credential_namespace).map_err(|_| {
+            AppError::new("DATA_CORRUPT", "本地凭证关联损坏，请保留数据目录后恢复。")
+        })?;
         let conn = connect(&dir.join("data.sqlite"))?;
         if !pointer.exists() {
             atomic_write(&pointer, dataset_id.as_bytes())?;
@@ -149,9 +175,17 @@ impl Store {
         let mut store = Self {
             root,
             dataset_id,
+            credential_namespace,
             conn,
             _lock: lock,
         };
+        if store
+            .conn
+            .pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))?
+            < SCHEMA_VERSION
+        {
+            crate::backup::upgrade(&mut store)?;
+        }
         let tx = store.conn.transaction()?;
         for mut task in list::<ModelTask>(&tx, "tasks")? {
             if task.status == "running" {
@@ -167,6 +201,25 @@ impl Store {
     }
     pub fn dir(&self) -> PathBuf {
         self.root.join("datasets").join(&self.dataset_id)
+    }
+    // Raw provider output can contain unsolicited feedback even during question generation.
+    // Apply this to display copies after persistence so failed output can still be reviewed later.
+    pub(crate) fn withhold_simulation_output(&self, tasks: &mut [ModelTask]) -> Result<()> {
+        let mut sessions = HashMap::new();
+        let mut query = self.conn.prepare_cached(
+            "SELECT 1 FROM interview_sessions WHERE id=?1 AND json_extract(data,'$.mode')='simulation' AND json_extract(data,'$.finished')=0",
+        )?;
+        for task in tasks.iter_mut().filter(|task| !task.content.is_empty()) {
+            let Some(id) = task.context_id.strip_prefix("interview:") else { continue };
+            let hidden = match sessions.entry(id) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => *entry.insert(query.exists([id])?),
+            };
+            if hidden {
+                task.content.clear();
+            }
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let versions = list::<ProfileVersion>(&self.conn, "profile_versions")?;
@@ -193,6 +246,8 @@ impl Store {
                 p
             })
             .collect();
+        let mut tasks = list(&self.conn, "tasks")?;
+        self.withhold_simulation_output(&mut tasks)?;
         Ok(Snapshot {
             contract_version: CONTRACT_VERSION,
             schema_version: SCHEMA_VERSION,
@@ -205,7 +260,7 @@ impl Store {
             interviews: list(&self.conn, "interviews")?,
             assets: list(&self.conn, "assets")?,
             providers: list(&self.conn, "providers")?,
-            tasks: list(&self.conn, "tasks")?,
+            tasks,
         })
     }
     pub fn mutate(

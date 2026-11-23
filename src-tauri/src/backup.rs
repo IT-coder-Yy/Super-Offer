@@ -1,20 +1,23 @@
 use crate::{
     domain::*,
-    store::{Store, atomic_write, bump, connect, digest, get, list, migrate, put, revision},
+    store::{
+        Store, atomic_write, bump, connect, get, list, migrate, migrate_to_current, put, revision,
+    },
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read, Seek, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 pub const MAX_BACKUP_BYTES: usize = 256 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 16] = [
     "profiles",
     "profile_versions",
     "jobs",
@@ -25,6 +28,12 @@ const TABLES: [&str; 10] = [
     "providers",
     "tasks",
     "operations",
+    "fill_runs",
+    "source_versions",
+    "source_files",
+    "evidence",
+    "interview_sessions",
+    "interview_reports",
 ];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,11 +81,22 @@ pub struct RestoreReceipt {
 }
 
 fn counts(conn: &Connection) -> Result<BTreeMap<String, u64>> {
-    TABLES
-        .into_iter()
+    let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let tables = match version {
+        1 => &TABLES[..10],
+        SCHEMA_VERSION => &TABLES[..],
+        _ => {
+            return Err(AppError::new(
+                "VERSION_UNSUPPORTED",
+                "无法读取此版本的数据数量。",
+            ));
+        }
+    };
+    tables
+        .iter()
         .map(|table| {
             Ok((
-                table.into(),
+                (*table).into(),
                 conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
                     r.get::<_, i64>(0)
                 })? as u64,
@@ -102,12 +122,42 @@ fn write_zip_file(writer: &mut zip::ZipWriter<fs::File>, name: &str, bytes: &[u8
     writer.write_all(bytes)?;
     Ok(())
 }
+fn copy_hashed(mut source: impl Read, mut target: impl Write, max: u64) -> Result<(u64, String)> {
+    let mut hash = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| AppError::invalid("文件大小不正确。"))?;
+        if size > max {
+            return Err(AppError::invalid("文件大小超过限制或读取期间发生变化。"));
+        }
+        hash.update(&buffer[..count]);
+        target.write_all(&buffer[..count])?;
+    }
+    Ok((size, format!("{:x}", hash.finalize())))
+}
+fn copy_verified(source: &Path, target: &Path, bytes: u64, sha256: &str) -> Result<()> {
+    let file = fs::File::create(target)?;
+    let actual = copy_hashed(fs::File::open(source)?, &file, bytes)?;
+    if actual != (bytes, sha256.to_owned()) {
+        return Err(AppError::invalid("文件校验失败，未替换当前数据。"));
+    }
+    file.sync_all()?;
+    Ok(())
+}
 pub fn export(store: &Store, include_audio: bool, include_source: bool) -> Result<BackupReceipt> {
     fs::create_dir_all(store.root.join("backups"))?;
     let temp = tempfile::tempdir_in(&store.root)?;
     let db_path = temp.path().join("data.sqlite");
     backup_db(&store.conn, &db_path)?;
     let db = connect(&db_path)?;
+    let schema_version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     db.execute_batch("PRAGMA secure_delete=ON;")?;
     let mut assets = list::<FileAsset>(&db, "assets")?;
     let mut files = Vec::new();
@@ -118,15 +168,20 @@ pub fn export(store: &Store, include_audio: bool, include_source: bool) -> Resul
             {
                 asset.status = AssetStatus::ExcludedByUser;
             } else {
-                match store.read_asset(&asset.id) {
-                    Ok((_, bytes)) => {
+                match store.asset_path(asset) {
+                    Ok(path) => {
                         let relative = format!("assets/{}", asset.id);
                         fs::create_dir_all(temp.path().join("assets"))?;
-                        fs::write(temp.path().join(&relative), &bytes)?;
+                        copy_verified(
+                            &path,
+                            &temp.path().join(&relative),
+                            asset.bytes,
+                            &asset.sha256,
+                        )?;
                         files.push(BackupFile {
                             path: relative,
-                            bytes: bytes.len() as u64,
-                            sha256: digest(&bytes),
+                            bytes: asset.bytes,
+                            sha256: asset.sha256.clone(),
                         });
                     }
                     Err(error) if error.code == "MATERIAL_MISSING" => {
@@ -147,22 +202,28 @@ pub fn export(store: &Store, include_audio: bool, include_source: bool) -> Resul
         }
         put(&db, "tasks", &task.id, &task)?;
     }
+    if schema_version == SCHEMA_VERSION {
+        crate::browser::sanitize_after_restore(&db, "")?;
+        crate::source::sanitize_after_restore(&db)?;
+        crate::interview::sanitize_after_restore(&db)?;
+    }
     let snapshot_counts = counts(&db)?;
     db.execute_batch("VACUUM;")?;
     drop(db);
-    let database = fs::read(&db_path)?;
+    let (database_bytes, database_hash) =
+        copy_hashed(fs::File::open(&db_path)?, std::io::sink(), MAX_EXPANDED)?;
     files.insert(
         0,
         BackupFile {
             path: "data.sqlite".into(),
-            bytes: database.len() as u64,
-            sha256: digest(&database),
+            bytes: database_bytes,
+            sha256: database_hash,
         },
     );
     let manifest = Manifest {
         format: "super-offer".into(),
-        format_version: 1,
-        schema_version: SCHEMA_VERSION,
+        format_version: schema_version,
+        schema_version,
         created_at: now(),
         counts: snapshot_counts,
         files,
@@ -186,11 +247,19 @@ pub fn export(store: &Store, include_audio: bool, include_source: bool) -> Resul
         &serde_json::to_vec_pretty(&manifest)?,
     )?;
     for file in &manifest.files {
-        write_zip_file(
-            &mut writer,
+        writer.start_file(
             &file.path,
-            &fs::read(temp.path().join(&file.path))?,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
         )?;
+        let actual = copy_hashed(
+            fs::File::open(temp.path().join(&file.path))?,
+            &mut writer,
+            file.bytes,
+        )?;
+        if actual != (file.bytes, file.sha256.clone()) {
+            return Err(AppError::invalid("备份暂存文件已变化。"));
+        }
     }
     let finished = writer.finish()?;
     finished.sync_all()?;
@@ -199,7 +268,7 @@ pub fn export(store: &Store, include_audio: bool, include_source: bool) -> Resul
     }
     drop(finished);
     // 同一校验路径验证刚生成的包，校验通过才向用户报告导出成功。
-    let verify = prepare(store, &fs::read(temp_file.path())?)?;
+    let verify = prepare_path(store, temp_file.path())?;
     drop(verify);
     temp_file
         .persist(&final_path)
@@ -221,7 +290,20 @@ pub fn prepare(store: &Store, bytes: &[u8]) -> Result<Prepared> {
     if bytes.is_empty() || bytes.len() > MAX_BACKUP_BYTES {
         return Err(AppError::invalid("备份为空或超过 256 MB。"));
     }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    prepare_reader(store, Cursor::new(bytes))
+}
+pub fn prepare_path(store: &Store, path: &Path) -> Result<Prepared> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() == 0 || file.metadata()?.len() > MAX_BACKUP_BYTES as u64 {
+        return Err(AppError::invalid("备份为空或超过256 MiB。"));
+    }
+    prepare_reader(store, file)
+}
+fn prepare_reader(store: &Store, reader: impl Read + Seek) -> Result<Prepared> {
+    let mut archive = zip::ZipArchive::new(reader)?;
+    if archive.has_duplicate_names() {
+        return Err(AppError::invalid("备份含有重复条目。"));
+    }
     if archive.len() > 10_002 {
         return Err(AppError::invalid("备份条目超过限制。"));
     }
@@ -257,8 +339,10 @@ pub fn prepare(store: &Store, bytes: &[u8]) -> Result<Prepared> {
     };
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     if manifest.format != "super-offer"
-        || manifest.format_version != 1
-        || manifest.schema_version != SCHEMA_VERSION
+        || !matches!(
+            (manifest.format_version, manifest.schema_version),
+            (1, 1) | (2, 2)
+        )
     {
         return Err(AppError::new(
             "VERSION_UNSUPPORTED",
@@ -282,17 +366,19 @@ pub fn prepare(store: &Store, bytes: &[u8]) -> Result<Prepared> {
         if source.size() != file.bytes {
             return Err(AppError::invalid("备份文件长度不匹配。"));
         }
-        let mut content = Vec::new();
-        source
-            .by_ref()
-            .take(file.bytes + 1)
-            .read_to_end(&mut content)?;
-        if content.len() as u64 != file.bytes || digest(&content) != file.sha256 {
+        let destination = fs::File::create(staged.path().join(&file.path))?;
+        let actual = copy_hashed(source.by_ref(), &destination, file.bytes)?;
+        if actual != (file.bytes, file.sha256.clone()) {
             return Err(AppError::invalid("备份文件校验失败，可能损坏或被修改。"));
         }
-        fs::write(staged.path().join(&file.path), content)?;
+        destination.sync_all()?;
     }
     let db = validate_database(&staged.path().join("data.sqlite"))?;
+    if db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))?
+        != manifest.schema_version
+    {
+        return Err(AppError::invalid("数据库版本与备份清单不一致。"));
+    }
     if counts(&db)? != manifest.counts {
         return Err(AppError::invalid("备份对象数量与清单不一致。"));
     }
@@ -345,9 +431,11 @@ pub fn validate_database(path: &Path) -> Result<Connection> {
     db.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")?;
     let mut expected = Connection::open_in_memory()?;
     migrate(&mut expected, include_str!("../migrations/001_initial.sql"))?;
-    if db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))? != SCHEMA_VERSION
-        || schema(&db)? != schema(&expected)?
-    {
+    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == SCHEMA_VERSION {
+        migrate_to_current(&mut expected)?;
+    }
+    if !matches!(version, 1 | 2) || schema(&db)? != schema(&expected)? {
         return Err(AppError::invalid(
             "数据库结构不符合本版本，拒绝未知表、触发器或迁移。",
         ));
@@ -506,6 +594,16 @@ pub fn validate_database(path: &Path) -> Result<Connection> {
                 "asset" => {
                     let _: FileAsset = get(&db, "assets", &reference.id)?;
                 }
+                _ if version == SCHEMA_VERSION
+                    && (crate::source::validate_history_reference(
+                        &db,
+                        &reference.kind,
+                        &reference.id,
+                    )? || crate::interview::validate_reference(
+                        &db,
+                        &reference.kind,
+                        &reference.id,
+                    )?) => {}
                 _ => return Err(AppError::invalid("任务引用类型无效。")),
             }
         }
@@ -517,6 +615,11 @@ pub fn validate_database(path: &Path) -> Result<Connection> {
         {
             return Err(AppError::invalid("模型任务状态无效。"));
         }
+    }
+    if version == SCHEMA_VERSION {
+        crate::browser::validate_database(&db)?;
+        crate::source::validate_database(&db)?;
+        crate::interview::validate_database(&db)?;
     }
     Ok(db)
 }
@@ -557,20 +660,39 @@ pub fn commit(
         ));
     }
     let previous_backup = export(store, true, true)?;
+    activate(store, prepared, previous_backup, None)
+}
+pub(crate) fn upgrade(store: &mut Store) -> Result<()> {
+    // 先验证并备份旧库，迁移只发生在新数据集，原active和旧文件始终保留。
+    validate_database(&store.dir().join("data.sqlite"))?;
+    let previous_backup = export(store, true, true)?;
+    let prepared = prepare_path(store, Path::new(&previous_backup.path))?;
+    let credential_namespace = store.credential_namespace.clone();
+    activate(store, prepared, previous_backup, Some(credential_namespace))?;
+    Ok(())
+}
+fn activate(
+    store: &mut Store,
+    prepared: Prepared,
+    previous_backup: BackupReceipt,
+    local_credential_namespace: Option<String>,
+) -> Result<RestoreReceipt> {
     let dataset_id = id();
     let target = store.root.join("datasets").join(&dataset_id);
     fs::create_dir(&target)?;
     fs::create_dir(target.join("assets"))?;
     // 在活动指针切换前完成全部校验、复制和写入；旧目录始终保留。
     for file in &prepared.preview.manifest.files {
-        let content = fs::read(prepared.staged.path().join(&file.path))?;
-        if content.len() as u64 != file.bytes || digest(&content) != file.sha256 {
-            return Err(AppError::invalid("预检材料已改变，未执行恢复。"));
-        }
-        atomic_write(&target.join(&file.path), &content)?;
+        copy_verified(
+            &prepared.staged.path().join(&file.path),
+            &target.join(&file.path),
+            file.bytes,
+            &file.sha256,
+        )?;
     }
     validate_database(&target.join("data.sqlite"))?;
     let mut connection = connect(&target.join("data.sqlite"))?;
+    migrate_to_current(&mut connection)?;
     let tx = connection.transaction()?;
     for mut task in list::<ModelTask>(&tx, "tasks")? {
         task.dataset_id = dataset_id.clone();
@@ -580,11 +702,21 @@ pub fn commit(
         }
         put(&tx, "tasks", &task.id, &task)?;
     }
+    crate::browser::sanitize_after_restore(&tx, &dataset_id)?;
+    crate::source::sanitize_after_restore(&tx)?;
+    crate::interview::sanitize_after_restore(&tx)?;
     bump(&tx)?;
     tx.commit()?;
+    validate_database(&target.join("data.sqlite"))?;
+    let credential_namespace = local_credential_namespace.unwrap_or_else(|| dataset_id.clone());
+    atomic_write(
+        &target.join(crate::store::CREDENTIAL_NAMESPACE_FILE),
+        credential_namespace.as_bytes(),
+    )?;
     atomic_write(&store.root.join("active"), dataset_id.as_bytes())?;
     store.conn = connection;
     store.dataset_id = dataset_id.clone();
+    store.credential_namespace = credential_namespace;
     Ok(RestoreReceipt {
         dataset_id,
         previous_backup,
@@ -596,6 +728,17 @@ pub fn copy_backup(store: &Store, backup_id: &str, destination: &Path) -> Result
         .root
         .join("backups")
         .join(format!("{backup_id}.superoffer"));
-    let bytes = fs::read(source)?;
-    atomic_write(destination, &bytes)
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::invalid("保存位置无效。"))?;
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    copy_hashed(
+        fs::File::open(source)?,
+        temp.as_file(),
+        MAX_BACKUP_BYTES as u64,
+    )?;
+    temp.as_file().sync_all()?;
+    temp.persist(destination)
+        .map_err(|_| AppError::new("WRITE_FAILED", "备份副本未保存，原文件保持不变。"))?;
+    Ok(())
 }

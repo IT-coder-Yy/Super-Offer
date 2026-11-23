@@ -25,3 +25,6 @@ csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; 
 [bundle]
 active = false
 icon = ["../.s0-work/icons/icon.png", "../.s0-work/icons/icon.ico", "../.s0-work/icons/icon.icns"]
+
+[bundle.resources]
+"../.s0-work/browser-runtime/" = "browser-runtime/"

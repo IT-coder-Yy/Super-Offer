@@ -12,9 +12,13 @@ Super-Offer 的原创代码采用 MIT。以下组件及其传递依赖保持各�
 | 系统凭证 | keyring 4.2.0 | MIT OR Apache-2.0 |
 | HTTP / 流式 | reqwest 0.13.5、eventsource-stream 0.2.3 | MIT OR Apache-2.0 |
 | 压缩 / 临时目录 | zip 9.5.1、tempfile 3.27.0 | MIT；MIT OR Apache-2.0 |
-| 开发与测试 | Vite 8.3.8、TypeScript 7.0.2、Playwright Core 1.65.0 | MIT；Apache-2.0；Apache-2.0 |
+| 浏览器辅助进程 | Node.js 24.14.1、Playwright Core 1.65.0 | Node 主许可 MIT，内含依赖各按原许可；Playwright Apache-2.0，内含素材另列 |
+| 只读目录能力 | cap-std / cap-fs-ext 4.0.3 | MIT OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception，本分发选择 MIT；传递依赖各自履约 |
+| 开发与测试 | Vite 8.3.8、TypeScript 7.0.2 | MIT；Apache-2.0 |
 
 `npm run licenses` 从已安装依赖和 Cargo 锁文件收集许可全文。缺少独立全文的三个补充来源在首次构建时下载，按脚本中固定的 SHA-256 校验后缓存到 `.s0-work/license-cache`；后续使用缓存仍校验哈希，不依赖仓库内的三份许可证副本。构建将 `third-party-notices.txt` 与 `cmaps/LICENSE` 嵌入应用资源；“数据备份 → 第三方许可”可离线查看。该清单也包含编译期依赖，不表示其中每个包都进入最终运行代码。发布前仍需针对各架构实际构建复核。
+
+`npm run browser:prepare` 从 Node 官方固定分发包提取可执行文件及完整 `LICENSE`，作为 `NODE-LICENSE.txt` 随辅助进程提供；其中包含 Node 依赖的版权和许可，不截取为单一 MIT 文本。Playwright 的 `LICENSE`、`NOTICE`、`ThirdPartyNotices` 及随包内部许可一并保留并纳入离线声明。未捆绑 Chrome、Edge 或其它浏览器。准确源码见 [Node v24.14.1](https://github.com/nodejs/node/tree/v24.14.1)、[Playwright v1.65.0](https://github.com/microsoft/playwright/tree/v1.65.0)、[cap-std 4.0.3 发布源码](https://github.com/sunfishcode/cap-std/tree/b7acf8e8807fe3fab991884d2208b7e03d35a409)。
 
 补充来源：
 

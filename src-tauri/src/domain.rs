@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const SCHEMA_VERSION: u32 = 1;
-pub const CONTRACT_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 2;
 pub const MAX_TEXT: usize = 1_000_000;
 pub type Fields = BTreeMap<String, String>;
 pub type Result<T> = std::result::Result<T, AppError>;
