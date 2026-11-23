@@ -2,7 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { chromium } from "playwright-core";
 import { installWorld } from "./page.mjs";
-import { inferMappings, readValue, repeated, addLabels } from "./mapping.mjs";
+import { inferMappings, readValue, repeated, addLabels, otherPerson } from "./mapping.mjs";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const stopped = () =>
@@ -456,7 +456,7 @@ export class BrowserConnection {
     this.context = executionContextId;
     this.documentId = randomUUID();
     const result = await session.send("Runtime.evaluate", {
-      expression: `(${installWorld.toString()})(${JSON.stringify(this.binding)},${JSON.stringify(this.documentId)})`,
+      expression: `(${installWorld.toString()})(${JSON.stringify(this.binding)},${JSON.stringify(this.documentId)},${otherPerson})`,
       contextId: this.context,
       returnByValue: true,
     });

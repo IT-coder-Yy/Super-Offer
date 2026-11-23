@@ -71,7 +71,7 @@ const groupWords = {
   skills: /技能|语言|skill/i,
   intentions: /意向|求职|期望/i,
 };
-const otherPerson = /联系人|联络人|推荐人|证明人|监护人|家庭成员|emergency[\s_-]*contact|\b(?:referees?|references?)\b/i;
+export const otherPerson = /联系人|联络人|推荐人|证明人|监护人|家庭成员|emergency[\s_-]*contact|\b(?:referees?|references?)\b/i;
 export const repeated = new Set([
   "education",
   "experience",

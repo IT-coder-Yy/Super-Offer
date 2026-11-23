@@ -1,5 +1,5 @@
 // 此函数只在选定页面的 CDP 隔离世界运行；页面主世界没有业务桥接权限。
-export function installWorld(binding, documentId) {
+export function installWorld(binding, documentId, otherPerson) {
   globalThis.__superOffer?.dispose();
   const originalUrl = location.href;
   let mountedUrl = originalUrl;
@@ -342,18 +342,21 @@ export function installWorld(binding, documentId) {
     }
     return { entryId: null };
   };
+  const groupSelector = "fieldset,[data-section],section,[role=group],.form-section,.form-group";
   const section = (el) => {
-    const module = moduleOf(el);
-    if (module?.title) return module.title;
-    const root = el.closest(
-      "fieldset,[data-section],section,[role=group],.form-section,.form-group",
-    );
-    return (
-      root?.getAttribute("aria-label") ||
-      root?.querySelector("legend,h1,h2,h3,h4,[role=heading]")?.textContent ||
-      root?.getAttribute("data-section") ||
-      ""
-    ).trim();
+    let nearest = moduleOf(el)?.title || "";
+    const first = el.closest(groupSelector), form = el.closest("form");
+    for (let group = first; group; group = group.parentElement?.closest(groupSelector)) {
+      const title = (labelledBy(group) || group.getAttribute("aria-label") ||
+        [...group.querySelectorAll("legend,h1,h2,h3,h4,h5,h6,[role=heading]")].find(
+          (heading) => heading.closest(groupSelector + ",form") === group,
+        )?.textContent || group.getAttribute("data-section") || "").trim();
+      // 外层决定资料属于谁；普通分组仍采用最近的标题，不借相邻子组的标题。
+      const owner = title.match(otherPerson);
+      if (owner) return title.length <= 200 ? title : owner[0];
+      if (!nearest && (group === first || !form || form.contains(group))) nearest = title;
+    }
+    return nearest;
   };
   const uploadScope = (el) => {
     let scope = el;

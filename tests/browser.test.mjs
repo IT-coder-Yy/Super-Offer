@@ -172,6 +172,45 @@ async function fill(connection, mode = "full") {
   await connection.job;
   return connection.state();
 }
+test("R20 联系人字段被普通 form-group 包住也不会使用本人资料，旁边的本人资料仍可填写", async (t) => {
+  const rows = [];
+  for (const shape of ["直接分组", "无标题内层", "内层联系方式", "ARIA 外层"]) {
+    const first = profile("合成甲"), second = profile("合成乙");
+    second.data.basic.phone = "13800000002";
+    const { page, connection } = await setup(t, first);
+    await page.locator("form").evaluate((form, shape) => {
+      const field = (label, hint) => '<label>' + label + '<input autocomplete="' + hint + '"></label>';
+      const fields = [field("姓名", "name"), field("电话", "tel")];
+      let controls = fields.join("");
+      if (shape === "无标题内层") controls = fields.map((html) => '<div class="form-group">' + html + '</div>').join("");
+      if (shape === "内层联系方式" || shape === "ARIA 外层") controls = '<div class="form-group"><h3>联系方式</h3>' + controls + '</div>';
+      const alternate = shape === "ARIA 外层"
+        ? '<span id="role-label">本人资料</span><div role="group" id="alternate" aria-labelledby="role-label">' + controls + '</div>'
+        : '<fieldset id="alternate"><legend id="role-label">本人资料</legend>' + controls + '</fieldset>';
+      const self = shape === "直接分组" ? '<fieldset id="self"><legend>个人资料</legend>' + fields.join("") + '</fieldset>' : '<div id="self">' + fields.join("") + '</div>';
+      form.innerHTML = '<div class="form-group">' + alternate + self + '</div><button type="button">填写紧急联系人</button>';
+      form.querySelector("button").onclick = () => {
+        form.querySelector("#role-label").textContent = "紧急联系人";
+        for (const el of form.querySelectorAll("#alternate input")) el.value = "";
+      };
+    }, shape);
+    const values = (section) => page.locator(section + " input").evaluateAll((els) => els.map((el) => el.value));
+    await fill(connection);
+    const before = await values("#alternate");
+    await page.getByRole("button", { name: "填写紧急联系人" }).click();
+    const contacts = (await connection.inspect()).slice(0, 2);
+    const pending = () => contacts.every((f) => connection.results.some((r) => r.fieldId === f.id && r.status === "pending" && !r.path));
+    await fill(connection, "blank");
+    const afterBlank = await values("#alternate"), blankPending = pending();
+    await connection.switchProfile(second, []);
+    await fill(connection);
+    rows.push({ shape, before, afterBlank, blankPending, afterSwitch: await values("#alternate"), switchPending: pending(), self: await values("#self") });
+  }
+  t.diagnostic(JSON.stringify(rows));
+  for (const row of rows) assert.deepEqual(row, { shape: row.shape, before: ["合成甲", profile().data.basic.phone],
+    afterBlank: ["", ""], blankPending: true, afterSwitch: ["", ""], switchPending: true, self: ["合成乙", "13800000002"] });
+});
+
 test("R19 主动断开先撤写权限，已发生的网页回滚进入最后的进度", async (t) => {
   const { page, connection, events } = await setup(t);
   await page.locator("form").evaluate((form) => {
