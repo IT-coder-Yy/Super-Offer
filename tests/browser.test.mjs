@@ -270,6 +270,51 @@ test("R20 网站脚本替换手机号或控件改问联系人，不能为原手�
   for (const row of rows) assert.deepEqual(row, { mode: row.mode, value: "13800000001", status: "pending", pending: 1 });
 });
 
+test("R20 普通下一步能读取未取消的点击，停止冒泡仍打开原生 popover", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>姓名<input></label><button type="button" popovertarget="stage"><span>下一步</span></button><output>第一步</output><div id="stage" popover>第二步内容</div>';
+    form.querySelector("button").onclick = (event) => {
+      event.stopPropagation();
+      window.cancelledAtHandler = event.defaultPrevented;
+      if (!event.defaultPrevented) form.querySelector("output").value = "第二步";
+    };
+  });
+  const read = () => page.evaluate(() => ({ cancelled: window.cancelledAtHandler, step: document.querySelector("output").value, open: document.querySelector("#stage").matches(":popover-open") }));
+  await fill(connection);
+  await connection.advance(false);
+  const automatic = await read();
+  await page.locator("#stage").evaluate((el) => { if (el.matches(":popover-open")) el.hidePopover(); });
+  await page.getByRole("button", { name: "下一步" }).click();
+  const manual = await read(), expected = { cancelled: false, step: "第二步", open: true };
+  t.diagnostic(JSON.stringify({ automatic, manual }));
+  assert.deepEqual(automatic, expected);
+  assert.deepEqual(manual, expected);
+});
+
+test("R20 下一步处理器把点击交给内部文字并改为提交，停止冒泡也不会代交", async (t) => {
+  const { page, connection } = await setup(t);
+  await page.locator("form").evaluate((form) => {
+    form.innerHTML = '<label>姓名<input></label><button type="button"><span>下一步</span></button>';
+    const next = form.querySelector("button"), caption = next.firstElementChild;
+    window.submits = 0; window.targets = [];
+    window.addEventListener("submit", (event) => { window.submits++; event.preventDefault(); }, true);
+    next.onclick = (event) => {
+      window.targets.push(event.target.tagName);
+      if (event.target === next) { caption.click(); return; }
+      event.stopPropagation();
+      next.type = "submit"; caption.textContent = "最终提交"; next.onclick = null;
+    };
+  });
+  await fill(connection);
+  await connection.advance(false);
+  const automatic = await page.evaluate(() => window.submits);
+  await page.getByRole("button", { name: "最终提交" }).click();
+  const actual = { automatic, ...await page.evaluate(() => ({ afterPerson: window.submits, targets: window.targets })) };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { automatic: 0, afterPerson: 1, targets: ["BUTTON", "SPAN"] });
+});
+
 test("R19 主动断开先撤写权限，已发生的网页回滚进入最后的进度", async (t) => {
   const { page, connection, events } = await setup(t);
   await page.locator("form").evaluate((form) => {

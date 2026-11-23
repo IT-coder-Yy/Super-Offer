@@ -754,6 +754,18 @@ export function installWorld(binding, documentId, otherPerson) {
       reason: "已回读页面值；未确认服务端保存",
     };
   };
+  // Chrome／Edge 在 click 处理器结束后用 DOMActivate 执行按钮默认动作。先用脱离页面的表单验证可拦截。
+  const canGuardButton = (() => {
+    const form = document.createElement("form"), button = document.createElement("button");
+    button.type = "reset";
+    form.append(button);
+    let resets = 0;
+    form.addEventListener("reset", () => resets++);
+    button.click();
+    button.addEventListener("DOMActivate", (event) => event.preventDefault());
+    button.click();
+    return resets === 1;
+  })();
   const action = (packet) => {
     if (!safe(packet)) return { status: "stale" };
     const login = loginReason();
@@ -810,6 +822,9 @@ export function installWorld(binding, documentId, otherPerson) {
       )
     )
       return { status: "pending", reason: "本页必填校验未完成，请补齐后继续" };
+    const nativeButton = ["BUTTON", "INPUT"].includes(el.tagName);
+    if (nativeButton && !canGuardButton)
+      return { status: "pending", reason: "当前浏览器无法安全触发此按钮，请本人在网页操作" };
     if (packet.action === "next") {
       reviewWrites();
       reviewInvalidFields();
@@ -817,12 +832,20 @@ export function installWorld(binding, documentId, otherPerson) {
       pendingNext = { generation: packet.generation, documentId, url: location.href,
         fields, ids: new Set(fields.map(key)), meanings: new Set(currentFields.map(fieldMeaning)) };
     }
-    // 原生按钮本次只执行站点点击逻辑，不能因 onclick 改成 submit 而顺带最终提交。
-    const nativeButton = ["BUTTON", "INPUT"].includes(el.tagName);
-    const preventButtonDefault = (event) => { if (event.target === el) event.preventDefault(); };
-    if (nativeButton) window.addEventListener("click", preventButtonDefault, true);
+    let blocked = false;
+    const guard = (event) => {
+      if (["submit", "image", "reset"].includes(el.type)) {
+        event.preventDefault();
+        blocked = true;
+      }
+    };
+    if (nativeButton) el.addEventListener("DOMActivate", guard, true);
     try { el.click(); }
-    finally { if (nativeButton) window.removeEventListener("click", preventButtonDefault, true); }
+    finally { if (nativeButton) el.removeEventListener("DOMActivate", guard, true); }
+    if (blocked) {
+      pendingNext = null;
+      return { status: "pending", reason: "按钮会提交或重置表单，已阻止，请本人核对" };
+    }
     return { status: "done" };
   };
   const onNavigate = (event) => {
