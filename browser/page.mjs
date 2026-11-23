@@ -183,9 +183,11 @@ export function installWorld(binding, documentId, otherPerson) {
     if (event.isTrusted && !writing && event.target !== host) {
       pendingNext = null;
       if (["running", "waiting"].includes(view.status)) send("user-navigation");
-      touched.add(event.target);
-      if (event.target.type === "radio")
-        for (const el of radios(event.target)) touched.add(el);
+      for (const el of event.target.type === "radio" ? radios(event.target) : [event.target]) {
+        touched.add(el);
+        const check = invalidFields.get(el);
+        if (check?.requiresEdit) check.editedValue = String(value(el));
+      }
     }
   };
   const onUserClick = (event) => {
@@ -551,12 +553,13 @@ export function installWorld(binding, documentId, otherPerson) {
         invalidFields.delete(el);
         continue;
       }
+      const actual = String(value(el));
       if (el.disabled || el.readOnly || !validValue(el) ||
-          (required(el) && !String(value(el)).trim()) || (check.requiresEdit && !touched.has(el))) continue;
+          (required(el) && !actual.trim()) || (check.requiresEdit && check.editedValue !== actual)) continue;
       invalidFields.delete(el);
       clearPending(el);
       validationResults.set(key(el), { fieldId: key(el), label: field(el).label,
-        actual: String(value(el)), status: "preserved", reason: "已回读校验通过的现有内容" });
+        actual, status: "preserved", reason: "已回读校验通过的现有内容" });
     }
   };
   const reviewWrites = () => {
@@ -657,10 +660,12 @@ export function installWorld(binding, documentId, otherPerson) {
       )
     )
       return fail("此项须本人在网站处理，工具不代填");
-    if (packet.value == null || packet.value === "")
+    if (packet.value == null || packet.value === "") {
+      if (required(el) && !current.trim()) rememberInvalid(el, true);
       return current && previous
         ? fail("换档缺值，保留旧内容，请人工核对")
         : fail("档案缺少此项");
+    }
     if (current && (!previous || previous.value !== current || previous.choice !== beforeChoice))
       return fail("原有内容或来源无法确认，已保留");
     if (

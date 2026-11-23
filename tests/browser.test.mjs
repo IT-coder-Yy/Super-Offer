@@ -211,6 +211,65 @@ test("R20 联系人字段被普通 form-group 包住也不会使用本人资料�
     afterBlank: ["", ""], blankPending: true, afterSwitch: ["", ""], switchPending: true, self: ["合成乙", "13800000002"] });
 });
 
+async function missingRequiredPhone(t, navigate = false) {
+  const selected = profile();
+  delete selected.data.basic.phone;
+  const { page, connection } = await setup(t, selected);
+  await page.locator("form").evaluate((form, navigate) => {
+    form.innerHTML = '<label><span>手机</span><input id="phone" type="tel" required pattern="1[0-9]{10}"></label><button type="button">下一步</button>';
+    form.querySelector("button").onclick = () => {
+      const input = form.querySelector("input");
+      sessionStorage.setItem("atNext", JSON.stringify({ value: input.value, marked: input.hasAttribute("data-super-offer-pending") }));
+      if (navigate) location.href = "/step2";
+    };
+  }, navigate);
+  await fill(connection, "blank");
+  return { page, connection, phone: page.locator("#phone") };
+}
+
+test("R20 档案缺必填手机，手填无效时保留待办，手填有效直接翻页时旧行准确归档", async (t) => {
+  const { page, connection, phone } = await missingRequiredPhone(t, true);
+  const original = connection.documentId;
+  const row = () => connection.results.find((r) => r.documentId === original && r.label === "手机");
+  assert.equal(row().status, "pending");
+  assert.ok(await phone.getAttribute("data-super-offer-pending"));
+  await phone.fill("123");
+  await connection.advance(false);
+  const invalid = { value: await phone.inputValue(), marked: !!await phone.getAttribute("data-super-offer-pending"), status: row().status,
+    clicked: !!await page.evaluate(() => sessionStorage.getItem("atNext")) };
+  const valid = "13800000001";
+  await phone.fill(valid);
+  await connection.advance(false);
+  await page.waitForURL("**/step2");
+  const actual = { invalid, atNext: await page.evaluate(() => JSON.parse(sessionStorage.getItem("atNext"))),
+    status: row().status, recorded: row().actual, pending: connection.state().pending };
+  t.diagnostic(JSON.stringify(actual));
+  assert.deepEqual(actual, { invalid: { value: "123", marked: true, status: "pending", clicked: false },
+    atNext: { value: valid, marked: false }, status: "preserved", recorded: valid, pending: 0 });
+});
+
+test("R20 网站脚本替换手机号或控件改问联系人，不能为原手机待办记作本人修正", async (t) => {
+  const rows = [];
+  for (const mode of ["脚本填写", "本人无效后脚本替换", "改题后手填"]) {
+    const { page, connection, phone } = await missingRequiredPhone(t);
+    if (mode === "改题后手填") {
+      await page.locator("label span").evaluate((el) => { el.textContent = "紧急联系人手机"; });
+      await phone.fill("13800000001");
+    } else {
+      if (mode === "本人无效后脚本替换") await phone.fill("123");
+      await phone.evaluate((el) => {
+        el.value = "13800000001";
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    await connection.advance(false);
+    const original = connection.results.find((r) => r.label === "手机");
+    rows.push({ mode, value: await phone.inputValue(), status: original?.status, pending: connection.state().pending });
+  }
+  t.diagnostic(JSON.stringify(rows));
+  for (const row of rows) assert.deepEqual(row, { mode: row.mode, value: "13800000001", status: "pending", pending: 1 });
+});
+
 test("R19 主动断开先撤写权限，已发生的网页回滚进入最后的进度", async (t) => {
   const { page, connection, events } = await setup(t);
   await page.locator("form").evaluate((form) => {
